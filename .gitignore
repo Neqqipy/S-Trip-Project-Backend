@@ -1,0 +1,18 @@
+﻿# IDE / Editor
+.vs/
+.vscode/
+
+# Python & Môi trường ảo
+__pycache__/
+venv/
+env/
+*.pyc
+*.pyo
+
+# Biến môi trường (Bảo mật)
+.env
+
+# Database / Data files
+saved_places_db.json
+*.sqlite3
+*.db

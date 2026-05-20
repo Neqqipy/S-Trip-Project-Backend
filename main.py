@@ -1,21 +1,51 @@
 ﻿# pip install -r requirements.txt
 # python main.py
 
-import os, re
+import os, re, urllib.parse, time, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-app = Flask(__name__)
-CORS(app)
 from dotenv import load_dotenv
 import google.generativeai as genai
+from datetime import timedelta 
 
 # Import các service
 from hotel_services import get_smart_hotel_recommendations
-from flight_services import get_smart_flight_recommendations
+from flight_services import get_smart_flight_recommendations, resolve_airport, is_route_operated, get_effective_iata
+from direction_service import get_all_modes_directions
+from transport_service import decide_transport
+from auth_routes import auth_bp, init_oauth 
+from itinerary_builder import build_itinerary
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+
+app.secret_key = os.getenv("SECRET_KEY", "dev-key")
+app.permanent_session_lifetime = timedelta(days=30)
+
+# FIX SESSION COOKIE: SameSite=None bi chon tren HTTP localhost
+# Dung 'Lax' cho dev HTTP, chi dung 'None' khi deploy HTTPS
+app.config.update(
+    SESSION_COOKIE_SAMESITE='None',   # None = gui cookie cross-site
+    SESSION_COOKIE_SECURE=False,      # Chrome 148+ cho phep None+HTTP tren localhost
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_NAME='strip_session',
+)
+
+# FIX CORS: must specify origins explicitly
+# Browser blocks cookies when using wildcard '*' with credentials:true
+_FRONTEND_ORIGINS = [
+    os.getenv("FRONTEND_URL", "http://localhost:3000"),
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+CORS(app, supports_credentials=True, origins=_FRONTEND_ORIGINS)
+
+app.register_blueprint(auth_bp)
+init_oauth(app)
+
+# FIX: In-memory cache cho proxy ảnh — tránh fetch lại cùng URL nhiều lần
+_proxy_image_cache = {}
+_tips_cache = {}
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -30,48 +60,266 @@ def get_google_search():
     from serpapi import GoogleSearch
     return GoogleSearch
 
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "status": "online",
+        "message": "S-Trip Backend is working fine!",
+        "version": "1.0.0"
+    })
+
+@app.route('/api/ai-specialties-tips')
+def ai_specialties_tips():
+    location = request.args.get('location', '').strip()
+    if not location:
+        return jsonify({'error': 'Missing location'}), 400
+ 
+    if location in _tips_cache:
+        return jsonify(_tips_cache[location])
+ 
+    try:
+        SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
+ 
+        # Search đặc sản nên mua tại location
+        params = {
+            'engine': 'google',
+            'q': f'đặc sản {location} nên mua về làm quà',
+            'api_key': SERPAPI_KEY,
+            'hl': 'vi',
+            'gl': 'vn',
+            'num': 5,
+        }
+        resp = requests.get('https://serpapi.com/search', params=params, timeout=10)
+        data = resp.json()
+ 
+        items = set()
+ 
+        # Lấy từ answer box / featured snippet nếu có
+        answer = data.get('answer_box', {})
+        for field in ['snippet', 'answer', 'list']:
+            val = answer.get(field, '')
+            if isinstance(val, list):
+                for v in val:
+                    text = re.sub(r'\(.*?\)', '', str(v)).strip(' .,;:-')
+                    if 3 < len(text) < 60:
+                        items.add(text)
+            elif isinstance(val, str):
+                for part in re.split(r'[,;\n•\-–]', val):
+                    part = re.sub(r'\(.*?\)', '', part).strip(' .,;:-')
+                    if 3 < len(part) < 60:
+                        items.add(part)
+ 
+        # Lấy thêm từ organic results snippets
+        for r in data.get('organic_results', [])[:4]:
+            snippet = r.get('snippet', '')
+            for part in re.split(r'[,;\n•]', snippet):
+                part = re.sub(r'\(.*?\)', '', part).strip(' .,;:-')
+                if 3 < len(part) < 50:
+                    items.add(part)
+ 
+        items = list(items)[:8]
+ 
+        # Tip mặc định nếu không parse được
+        if not items:
+            items = [f'Đặc sản {location}']
+ 
+        result = {
+            'items': items,
+            'tip': f'Nên mua tại chợ địa phương hoặc cửa hàng đặc sản uy tín ở {location} để đảm bảo chất lượng.'
+        }
+        _tips_cache[location] = result
+        return jsonify(result)
+ 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route("/api/chat-gemini", methods=["POST"])
 def chat_gemini():
     try:
         data = request.get_json()
         user_msg = data.get("message", "")
         location = data.get("location", "Đà Nẵng")
-        
-        # 1. Khởi tạo trực tiếp (Không dùng biến trung gian)
+
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        # 2. Ép AI trả lời (Thêm tiếng Việt rõ ràng)
+
         full_prompt = f"Bạn là trợ lý du lịch. Hãy trả lời cực kỳ ngắn gọn câu hỏi của bạn về du lịch {location}: {user_msg}"
-        
+
         response = model.generate_content(full_prompt)
-        
+
         if response and response.text:
             return jsonify({"success": True, "text": response.text})
         else:
             return jsonify({"success": False, "error": "Empty response"})
 
     except Exception as e:
-        # Hưng nhớ nhìn vào Terminal để copy dòng này cho mình nhé!
         print(f"❌ DEBUG LỖI THỰC TẾ: {str(e)}")
-        
-        # Câu dự phòng mới để Hưng biết là code đã được cập nhật
         return jsonify({
-            "success": True, 
+            "success": True,
             "text": f"Hệ thống Gemini đang phản hồi chậm. Bạn muốn biết gì về khách sạn ở {location} không?"
         })
 
 
-# ✈️ Mapping sân bay
-CITY_TO_IATA = {
-    "Đà Lạt": "DLI", "Đà Nẵng": "DAD", "Nha Trang": "CXR",
-    "Hà Nội": "HAN", "Phú Quốc": "PQC", "TP. Hồ Chí Minh": "SGN",
-    "Huế": "HUI", "Quy Nhơn": "UIH", "Cần Thơ": "VCA",
+
+GOOGLE_IMG_DOMAINS = (
+    "googleusercontent.com", "ggpht.com",
+    "googleapis.com", "googleapi",
+)
+
+def to_proxy_url(url, base=None):
+    if not url:
+        return url
+        
+    if "api/proxy-image" in url:
+        return url
+
+    if any(d in url for d in GOOGLE_IMG_DOMAINS):
+        if base is None:
+            try:
+                from flask import request as _req
+                base = _req.host_url.rstrip("/")
+            except RuntimeError:
+                base = os.getenv("API_BASE_URL", "http://localhost:5000")
+        return f"{base}/api/proxy-image?url={urllib.parse.quote(url, safe='')}"
+    return url
+
+
+# ----------------------------------------------------------------
+# 🕐 PHÂN LOẠI BUỔI PHÙ HỢP CHO ĐỊA ĐIỂM
+# ----------------------------------------------------------------
+
+# Keyword → buổi phù hợp (evening & morning dễ nhận diện hơn afternoon)
+_TIME_KEYWORDS = {
+    "morning": [
+        # Thiên nhiên / ngoài trời — nên đi sớm tránh nắng
+        "núi", "thác", "hồ", "vịnh", "bình minh", "sunrise",
+        "trekking", "leo núi", "hiking", "rừng", "vườn quốc gia",
+        "biển sáng", "đảo", "hang động",
+        # Ẩm thực & địa điểm sáng sớm
+        "cà phê", "cafe", "coffee", "bánh mì", "phở", "bún",
+        "chợ sáng", "chùa", "đền", "làng nghề", "chợ nổi",
+    ],
+    "afternoon": [
+        "bảo tàng", "museum", "gallery", "triển lãm", "di tích",
+        "khu phố cổ", "phố đi bộ", "trung tâm thương mại",
+        "mua sắm", "shopping", "spa", "công viên", "vui chơi",
+        "tháp", "cầu", "toà nhà", "kiến trúc", "làng",
+    ],
+    "evening": [
+        # Ẩm thực tối
+        "nhà hàng", "restaurant", "quán ăn", "hải sản", "lẩu",
+        "nướng", "buffet", "dimsum", "sushi", "cơm tối",
+        # Giải trí & cảnh đêm
+        "chợ đêm", "night market", "bar", "pub", "rooftop",
+        "club", "show", "biểu diễn", "hoàng hôn", "sunset",
+        "view đêm", "phố đêm", "tối", "đêm", "night", "evening",
+    ],
 }
 
+_SLOT_LABEL = {
+    "morning":   "🌅 Buổi sáng",
+    "afternoon": "☀️ Buổi chiều",
+    "evening":   "🌙 Buổi tối",
+}
+
+def _guess_best_time(name: str, desc: str) -> str:
+    """
+    Đoán buổi phù hợp nhất dựa trên keyword trong tên + mô tả địa điểm.
+
+    Trả về một trong:
+      "🌅 Buổi sáng" | "☀️ Buổi chiều" | "🌙 Buổi tối"
+
+    Mặc định "☀️ Buổi chiều" nếu không match keyword nào.
+    """
+    text = f"{name} {desc}".lower()
+
+    scores = {slot: 0 for slot in _TIME_KEYWORDS}
+    for slot, keywords in _TIME_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                scores[slot] += 1
+
+    best = max(scores, key=scores.get)
+
+    # Không match bất kỳ keyword nào → mặc định chiều (trung lập nhất)
+    if scores[best] == 0:
+        return _SLOT_LABEL["afternoon"]
+
+    return _SLOT_LABEL[best]
+
+
+# ----------------------------------------------------------------
+# 🖼️ FALLBACK ẢNH CHO ACTIVITY
+# ----------------------------------------------------------------
+
+def get_activity_image_fallback(place_name, location, api_key):
+    """
+    Tìm ảnh thật cho tour/food theo 2 tầng:
+      1. Google Maps Photos (qua data_id) — ảnh chính thức
+      2. Google Images — fallback nhanh
+    """
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return None
+
+    # Tầng 1: Google Maps Photos
+    try:
+        maps_res = GoogleSearch({
+            "engine": "google_maps",
+            "q": f"{place_name} {location}",
+            "hl": "vi",
+            "api_key": api_key,
+        }).get_dict()
+
+        data_id = (
+            maps_res.get("place_results", {}).get("data_id")
+            or next(
+                (r.get("data_id") for r in maps_res.get("local_results", []) if r.get("data_id")),
+                None,
+            )
+        )
+
+        if data_id:
+            photos = GoogleSearch({
+                "engine": "google_maps_photos",
+                "data_id": data_id,
+                "hl": "vi",
+                "api_key": api_key,
+            }).get_dict().get("photos", [])
+            if photos:
+                img = photos[0].get("image") or photos[0].get("thumbnail")
+                if img:
+                    return img
+    except Exception:
+        pass
+
+    # Tầng 2: Google Images
+    try:
+        images = GoogleSearch({
+            "engine": "google_images",
+            "q": f"{place_name} {location}",
+            "api_key": api_key,
+        }).get_dict().get("images_results", [])
+        if images:
+            img = images[0].get("original") or images[0].get("thumbnail")
+            if img:
+                return img
+    except Exception:
+        pass
+
+    return None
+
+
+# ----------------------------------------------------------------
+# 🗺️ LẤY DANH SÁCH HOẠT ĐỘNG + GẮN NHÃN BUỔI
+# ----------------------------------------------------------------
 
 def get_real_activities(location, query_type):
-    """Lấy dữ liệu thực từ Google Local. Trả về [] nếu không có SERPAPI_KEY."""
+    """
+    Lấy dữ liệu thực từ Google Local.
+    Mỗi địa điểm trả về có thêm trường `best_time` (buổi phù hợp nhất).
+    Trả về [] nếu không có SERPAPI_KEY.
+    """
     GoogleSearch = get_google_search()
     if not GoogleSearch:
         print(f"[Cảnh báo] Không có SERPAPI_KEY, bỏ qua tìm kiếm '{query_type}'")
@@ -85,51 +333,1054 @@ def get_real_activities(location, query_type):
             "hl": "vi",
             "api_key": SERPAPI_KEY
         })
-        results = search.get_dict().get("local_results", [])
-        return [
-            {
-                "name": r.get("title"),
-                "rating": str(r.get("rating", "4.5")),
-                "price": "Giá tùy chọn",
-                "desc": r.get("description", f"Địa điểm {query_type} nổi tiếng."),
-                "thumbnail": r.get("thumbnail")
-            } for r in results[:15]
-        ]
+
+        search_data = search.get_dict()
+
+        if "error" in search_data:
+            print("🚨 LỖI SERPAPI:", search_data["error"])
+
+        results = search_data.get("local_results", [])
+
+        processed_results = []
+        for r in results:
+            img_url = r.get("thumbnail") or r.get("featured_image")
+
+            # Nếu SerpAPI không trả ảnh, tìm ảnh thật từ Maps / Google Images
+            if not img_url:
+                img_url = get_activity_image_fallback(r.get("title", ""), location, SERPAPI_KEY)
+
+            # Placeholder cuối cùng nếu mọi nguồn đều thất bại
+            if not img_url:
+                img_url = "https://placehold.co/300x200?text=S-Trip"
+
+            name = r.get("title", "")
+            desc = r.get("description", f"Địa điểm {query_type} nổi tiếng.")
+            coords = r.get("gps_coordinates", {})
+
+            # FIX MAP: SerpAPI trả 2 loại ID:
+            # - place_id dạng "ChIJ..." → dùng cho Google Maps Embed / Places API
+            # - data_id  dạng "0x..."   → chỉ dùng nội bộ với google_maps_photos
+            # Frontend cần ChIJ để nhúng map → lọc bỏ data_id dạng hex
+            raw_place_id = r.get("place_id", "")
+            raw_data_id  = r.get("data_id", "")
+            maps_place_id = raw_place_id if raw_place_id and not raw_place_id.startswith("0x") else ""
+
+            processed_results.append({
+                "name":      name,
+                "rating":    str(r.get("rating", "4.5")),
+                "price":     "Giá tùy chọn",
+                "desc":      desc,
+                "thumbnail": to_proxy_url(img_url),
+                "lat":       coords.get("latitude"),
+                "lng":       coords.get("longitude"),
+                # FIX: place_id (ChIJ) cho embed map, data_id (0x) cho photos API
+                "place_id":  maps_place_id,
+                "data_id":   raw_data_id,
+                # ✅ Gắn nhãn buổi phù hợp dựa trên keyword trong tên + mô tả
+                "best_time": _guess_best_time(name, desc),
+            })
+
+        return processed_results[:20]
+
     except Exception as e:
         print(f"[Lỗi SerpAPI - {query_type}] {str(e)}")
         return []
 
 
+@app.route("/api/directions", methods=["GET"])
+def directions():
+    """
+    Lấy khoảng cách + thời gian giữa 2 điểm cho tất cả phương tiện.
+    Query params:
+      origin      — tên hoặc "lat,lng"
+      destination — tên hoặc "lat,lng"
+    """
+    origin      = request.args.get("origin", "")
+    destination = request.args.get("destination", "")
+    if not origin or not destination:
+        return jsonify({"success": False, "error": "Thiếu origin hoặc destination"}), 400
+    try:
+        modes = get_all_modes_directions(SERPAPI_KEY, origin, destination)
+        return jsonify({"success": True, "modes": modes})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+
 @app.route("/api/plan-trip", methods=["GET"])
 def plan_trip():
-    location = request.args.get("location", "Đà Lạt")
-    budget = int(re.sub(r"[^\d]", "", request.args.get("budget", "3000000")))
-    dest_iata = CITY_TO_IATA.get(location, "HAN")
+    location       = request.args.get("location", "Đà Lạt")
+    # Cho phép frontend truyền ?origin= hoặc ?from= (alias tiện hơn)
+    origin         = request.args.get("origin") or request.args.get("from", "TP. Hồ Chí Minh")
+    budget_raw     = request.args.get("budget", "5000000")
+    budget         = int(re.sub(r"[^\d]", "", budget_raw))
+    departure_date = request.args.get("departure_date", "2026-05-30")
+
+    # Xử lý chuỗi "4 ngày 3 đêm" để lấy số ngày chuẩn
+    days_raw = request.args.get("days", "3")
+    m        = re.search(r'\d+', days_raw)
+    num_days = int(m.group()) if m else 3
+
+    passengers = int(request.args.get("passengers", 1))
+
+    # Phân bổ ngân sách (40% khách sạn, 40% di chuyển)
+    hotel_budget  = budget * 0.4
+    transport_budget = budget * 0.4
 
     try:
-        hotels = get_smart_hotel_recommendations(
-            SERPAPI_KEY, f"{location}, Vietnam", (budget * 0.4) / 2
-        ) if SERPAPI_KEY else []
-
-        flights = get_smart_flight_recommendations(
-            SERPAPI_KEY, "SGN", dest_iata, budget * 0.4
-        ) if SERPAPI_KEY else []
-
+        # ── 1. Địa điểm tham quan + ăn uống (fetch TRƯỚC để tính trung tâm thực tế) ──
+        # Trung tâm = trung bình tọa độ tours+foods, chính xác hơn geocode tỉnh
+        # VD: Quảng Nam → Hội An (không phải Tam Kỳ — trung tâm hành chính tỉnh)
         tours = get_real_activities(location, "Điểm tham quan")
         foods = get_real_activities(location, "Quán ăn ngon")
+
+        # ── 2. Tìm Khách sạn — lọc theo trung tâm tours+foods ───────────────
+        hotels = get_smart_hotel_recommendations(
+            SERPAPI_KEY, location, hotel_budget, num_days, passengers, departure_date,
+            tours=tours, foods=foods,  # ✅ truyền vào để tính trung tâm thực tế
+        )
+
+        # ── 2. LẤY KHOẢNG CÁCH THỰC TẾ (Google Directions qua direction_service) ─
+        driving_info = None
+        distance_m   = None
+        driving_duration_text = None
+        try:
+            all_modes = get_all_modes_directions(SERPAPI_KEY, origin, location)
+            
+            # --- FIX: KIỂM TRA LINH HOẠT LIST HAY DICT ---
+            if isinstance(all_modes, dict):
+                driving_info = all_modes.get("driving") or all_modes.get("car")
+            elif isinstance(all_modes, list):
+                for m in all_modes:
+                    if isinstance(m, dict) and m.get("mode") in ["driving", "car"]:
+                        driving_info = m
+                        break
+
+            if driving_info:
+                distance_m            = driving_info.get("distance_m")
+                driving_duration_text = driving_info.get("duration_text")
+        except Exception as dir_err:
+            print(f"[plan_trip] Không lấy được khoảng cách: {dir_err}")
+
+        # ── 3. PHÂN GIẢI SÂN BAY ────────────────────────────────────────────
+        origin_info = resolve_airport(origin)
+        dest_info   = resolve_airport(location)
+
+        no_airport  = dest_info["no_airport"] or origin_info["no_airport"]
+        flight_note = dest_info.get("note") or origin_info.get("note") or ""
+
+        # ── 4. LẤY CHUYẾN BAY THẬT SỰ TỪ API ────────
+        FLIGHT_THRESHOLD_M = 150_000  # > 150km mới kích hoạt tìm máy bay
+        flights = []
+
+        # distance_m = 0 cũng coi là lỗi → treat như None
+        distance_m_valid = distance_m if distance_m else None
+
+        # Tính effective IATA (có thể qua hub) trước khi check same_airport,
+        # vì 2 thành phố khác nhau có thể cùng hub (VD: Đồng Nai + Vũng Tàu → SGN)
+        raw_origin_iata = origin_info["iata"]
+        raw_dest_iata   = dest_info["iata"]
+
+        # get_effective_iata() xét hướng đi để chọn hub đúng:
+        #   Bạc Liêu→DAD: CAH→[SGN]→DAD   Bạc Liêu→HAN: CAH→HAN trực tiếp
+        #   Đà Lạt→BMV:   DLI→[SGN]→BMV   Đồng Nai→Vũng Tàu: SGN→SGN (same hub)
+        effective_origin_iata = get_effective_iata(raw_origin_iata, raw_dest_iata)
+        effective_dest_iata   = get_effective_iata(raw_dest_iata,   effective_origin_iata)
+
+        # same_airport: chỉ true khi raw IATA của 2 tỉnh giống nhau
+        # (VD: Đồng Nai + Vũng Tàu đều map về SGN raw)
+        # KHÔNG dùng effective để check — vì effective có thể trùng hub dù raw khác
+        # (VD: Huế→HUI, Vũng Tàu→SGN, effective HUI→SGN — vẫn là 2 sân bay khác)
+        same_airport = bool(raw_origin_iata and raw_origin_iata == raw_dest_iata)
+
+        if same_airport:
+            hub = effective_origin_iata or raw_origin_iata or "?"
+            flight_note = (
+                f"Điểm xuất phát và đến cùng khu vực sân bay ({hub}), không cần bay — "
+                f"đề xuất di chuyển bằng xe."
+            )
+
+        # iata dùng trong flight_meta để frontend hiển thị
+        # nếu None (thành phố không nhận ra) → giữ None, frontend tự xử lý
+        flight_meta = {
+            "origin_airport":    effective_origin_iata or raw_origin_iata,
+            "dest_airport":      effective_dest_iata   or raw_dest_iata,
+            "raw_origin_airport": raw_origin_iata,
+            "raw_dest_airport":   raw_dest_iata,
+            "no_airport":        no_airport,
+            "note":              flight_note,
+        }
+
+        route_has_flights = (
+            not same_airport
+            and bool(effective_origin_iata)
+            and bool(effective_dest_iata)
+            and is_route_operated(effective_origin_iata, effective_dest_iata)
+        )
+        should_search_flights = (
+            route_has_flights
+            and (distance_m_valid is None or distance_m_valid > FLIGHT_THRESHOLD_M)
+        )
+        flight_available_flag = route_has_flights
+
+        if should_search_flights:
+            flights = get_smart_flight_recommendations(
+                SERPAPI_KEY, effective_origin_iata, effective_dest_iata,
+                budget, num_days, passengers, departure_date,
+            )
+
+        print(f"[DEBUG] should_search={should_search_flights}, eff_origin={effective_origin_iata}, eff_dest={effective_dest_iata}, route_ok={route_has_flights}, same={same_airport}, dist={distance_m_valid}")
+
+        # ── 5. QUYẾT ĐỊNH PHƯƠNG TIỆN ───────────────────────────────────────────
+        transport = decide_transport(
+            origin                = origin,
+            destination           = location,
+            distance_m            = distance_m_valid,
+            driving_duration_text = driving_duration_text,
+            flight_available      = flight_available_flag,
+            origin_info           = origin_info,   # raw info (iata sân bay gần nhất, dùng build leg xe)
+            dest_info             = dest_info,     # raw info
+            real_flights          = flights,
+            # Truyền thêm effective iata để build label chuyến bay đúng hub
+            effective_origin_iata = effective_origin_iata,
+            effective_dest_iata   = effective_dest_iata,
+        )
 
         return jsonify({
             "success": True,
             "plan": {
-                "hotels": hotels or [],
-                "flights": flights or [],
-                "tours": tours or [],    # ✅ Trả về tours cho frontend
-                "foods": foods or [],    # ✅ Trả về foods cho frontend
+                # Thông tin sân bay (tương thích ngược với frontend cũ)
+                "flight_meta": flight_meta,
+                "flights":     flights or [],
+                # ✅ MỚI: transport chứa đầy đủ lựa chọn phương tiện
+                "transport":   transport,
+                "hotels":      hotels  or [],
+                "tours":       tours   or [],
+                "foods":       foods   or [],
+                # ✅ Lịch trình theo ngày/buổi — quán ăn ghép gần địa điểm tham quan
+                "itinerary":   build_itinerary(hotels, tours, foods, num_days),
             }
         })
     except Exception as e:
-        print(f"[Lỗi plan_trip] {str(e)}")
+        print(f"Lỗi plan_trip: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/reviews", methods=["GET"])
+@app.route("/api/places/reviews", methods=["GET"])
+def get_place_reviews():
+    place    = request.args.get("place", "") or request.args.get("name", "")
+    place_id = request.args.get("place_id", "")
+
+    if place_id and not (place_id.startswith("ChIJ") or "0x" in place_id):
+        place_id = ""
+
+    if not place and not place_id:
+        return jsonify({"success": False, "reviews": []})
+
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return jsonify({"success": True, "reviews": []})
+
+    try:
+        reviews       = []
+        total_reviews = 0
+
+        # 1. FALLBACK:
+        if not place_id and place:
+            search_data  = GoogleSearch({"engine": "google_maps", "q": place, "hl": "vi", "api_key": SERPAPI_KEY}).get_dict()
+            place_results = search_data.get("place_results", {})
+
+            place_id = place_results.get("place_id") or place_results.get("data_id", "")
+
+            if not place_id:
+                local_data = GoogleSearch({
+                    "engine": "google_local",
+                    "q": place, # 🟢 Bỏ chữ "điểm du lịch"
+                    "location": "Vietnam",
+                    "hl": "vi",
+                    "api_key": SERPAPI_KEY
+                }).get_dict()
+
+            # Ưu tiên 3 (Dành cho Khách sạn): Không có ID nhưng Maps trả sẵn review
+            if not place_id and "reviews" in place_results:
+                reviews       = place_results.get("reviews", [])
+                total_reviews = place_results.get("reviews_unparsed", len(reviews))
+
+        # 2. KHI ĐÃ CÓ ID (Do Frontend truyền hoặc do Fallback tìm ra)
+        if place_id:
+            params = {"engine": "google_maps_reviews", "place_id": place_id, "hl": "vi", "api_key": SERPAPI_KEY}
+            data   = GoogleSearch(params).get_dict()
+
+            if "error" not in data:
+                reviews       = data.get("reviews", [])
+                total_reviews = data.get("place_info", {}).get("reviews") or len(reviews)
+
+        # 3. CHUẨN HÓA DỮ LIỆU TRẢ VỀ FRONTEND
+        result = [{
+            "user":    r.get("user", {}).get("name", "Ẩn danh"),
+            "avatar":  r.get("user", {}).get("thumbnail"),
+            "rating":  r.get("rating"),
+            "content": r.get("snippet", "") or r.get("text", ""),
+            "date":    r.get("date", ""),
+            "photos":  r.get("images", [])
+        } for r in reviews]
+
+        return jsonify({"success": True, "reviews": result, "total": total_reviews})
+
+    except Exception as e:
+        print(f"[Lỗi reviews] {e}")
+        return jsonify({"success": False, "reviews": [], "error": str(e)})
+
+
+@app.route("/api/province-images", methods=["GET"])
+def get_province_images():
+    """
+    Lấy ảnh tỉnh thành từ Google Maps Photos (full size, ổn định).
+    Query param: place — tên tỉnh
+    """
+    place = request.args.get("place", "")
+    if not place:
+        return jsonify({"success": False, "images": []})
+
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return jsonify({"success": True, "images": []})
+
+    try:
+        search_data = GoogleSearch({
+            "engine": "google_maps",
+            "q": f"du lịch {place} Việt Nam",
+            "hl": "vi",
+            "gl": "vn",
+            "api_key": SERPAPI_KEY
+        }).get_dict()
+
+        data_id = None
+        place_results = search_data.get("place_results", {})
+        data_id = place_results.get("data_id")
+
+        if not data_id:
+            local_results = search_data.get("local_results", [])
+            for r in local_results:
+                if r.get("data_id"):
+                    data_id = r["data_id"]
+                    break
+
+        if not data_id:
+            return jsonify({"success": False, "images": []})
+
+        photos_data = GoogleSearch({
+            "engine": "google_maps_photos",
+            "data_id": data_id,
+            "hl": "vi",
+            "api_key": SERPAPI_KEY
+        }).get_dict()
+
+        photos = photos_data.get("photos", [])
+        images = [p.get("image") or p.get("thumbnail") for p in photos
+                  if p.get("image") or p.get("thumbnail")]
+
+        return jsonify({"success": True, "images": images[:15]})
+
+    except Exception as e:
+        print(f"[Lỗi province-images] {e}")
+        return jsonify({"success": False, "images": []})
+
+
+@app.route("/api/images", methods=["GET"])
+@app.route("/api/places/images", methods=["GET"])
+def get_place_images():
+    place     = request.args.get("place", "") or request.args.get("name", "")
+    passed_id = request.args.get("place_id", "")
+
+    # Engine google_maps_photos BẮT BUỘC dùng định dạng ID là 0x...:0x...
+    data_id = passed_id if passed_id and "0x" in passed_id else ""
+
+    if not place and not data_id:
+        return jsonify({"success": False, "images": []})
+
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return jsonify({"success": True, "images": []})
+
+    try:
+        photos = []
+
+        # 1. FALLBACK: TÌM LẠI ĐÚNG DATA_ID CHUẨN (0x...:0x...)
+        if not data_id and place:
+            search_data   = GoogleSearch({"engine": "google_maps", "q": place, "hl": "vi", "api_key": SERPAPI_KEY}).get_dict()
+            place_results = search_data.get("place_results", {})
+            data_id       = place_results.get("data_id")
+
+            if not data_id:
+                local_results = search_data.get("local_results", [])
+                if local_results:
+                    data_id = local_results[0].get("data_id")
+
+        # 2. GỌI ENGINE LẤY ẢNH VỚI THAM SỐ `data_id`
+        if data_id:
+            data   = GoogleSearch({"engine": "google_maps_photos", "data_id": data_id, "hl": "vi", "api_key": SERPAPI_KEY}).get_dict()
+            photos = data.get("photos", [])
+
+        images = [p.get("image") or p.get("thumbnail") for p in photos if p.get("image") or p.get("thumbnail")]
+        return jsonify({"success": True, "images": images[:10]})
+
+    except Exception as e:
+        print(f"[Lỗi images] {e}")
+        return jsonify({"success": False, "images": []})
+
+
+@app.route("/api/proxy-image", methods=["GET"])
+def proxy_image():
+    """
+    Proxy ảnh từ Google (lh3.googleusercontent.com, v.v.) về browser.
+    - In-memory cache: cùng URL chỉ fetch 1 lần duy nhất từ Google
+    - Cache-Control header: browser tự cache 1 giờ, không gọi lại server
+    """
+    import urllib.parse
+    import urllib.request
+    from flask import Response
+
+    url = request.args.get("url", "")
+    if not url:
+        return jsonify({"error": "Thiếu url"}), 400
+
+    # FIX: Mở rộng whitelist bao gồm serpapi CDN và các subdomain lh1-lh6
+    ALLOWED = (
+        "lh1.googleusercontent.com",
+        "lh2.googleusercontent.com",
+        "lh3.googleusercontent.com",
+        "lh4.googleusercontent.com",
+        "lh5.googleusercontent.com",
+        "lh6.googleusercontent.com",
+        "streetviewpixels-pa.googleapis.com",
+        "maps.googleapis.com",
+        "geo0.ggpht.com",
+        "geo1.ggpht.com",
+        "geo2.ggpht.com",
+        "geo3.ggpht.com",
+        # SerpAPI CDN thumbnails
+        "serpapi.com",
+        "encrypted-tbn0.gstatic.com",
+        "encrypted-tbn1.gstatic.com",
+        "encrypted-tbn2.gstatic.com",
+        "encrypted-tbn3.gstatic.com",
+    )
+    parsed = urllib.parse.urlparse(url)
+    # FIX: Kiểm tra suffix thay vì exact match để bắt subdomain động
+    netloc = parsed.netloc
+    if not any(netloc == d or netloc.endswith("." + d) for d in ALLOWED):
+        return jsonify({"error": "Domain không được phép"}), 403
+
+    if url in _proxy_image_cache:
+        data, content_type = _proxy_image_cache[url]
+        resp = Response(data, content_type=content_type)
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            content_type = r.headers.get("Content-Type", "image/jpeg")
+            data         = r.read()
+
+        if len(_proxy_image_cache) < 300:
+            _proxy_image_cache[url] = (data, content_type)
+
+        resp = Response(data, content_type=content_type)
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
+    except Exception as e:
+        print(f"[PROXY FAIL] {url[:80]} → {e}")
+        return Response(status=302, headers={
+            "Location": "https://placehold.co/400x300?text=S-Trip+Hotel",
+            "Access-Control-Allow-Origin": "*",
+        })
+
+
+@app.route("/api/proxy-image-b64", methods=["GET"])
+def proxy_image_b64():
+    """
+    Trả ảnh dạng base64 data URL — dùng cho html2canvas screenshot.
+    html2canvas không đọc được blob/proxy URL cross-origin,
+    nhưng data URL thì luôn hoạt động.
+    """
+    import urllib.parse, urllib.request, base64
+    from flask import Response
+
+    url = request.args.get("url", "")
+    if not url:
+        return jsonify({"error": "Thiếu url"}), 400
+
+    # Thử lấy từ cache proxy thường trước
+    if url in _proxy_image_cache:
+        data, content_type = _proxy_image_cache[url]
+        b64 = base64.b64encode(data).decode()
+        return jsonify({"data": f"data:{content_type};base64,{b64}"})
+
+    ALLOWED = (
+        "lh3.googleusercontent.com", "lh4.googleusercontent.com",
+        "lh5.googleusercontent.com", "streetviewpixels-pa.googleapis.com",
+        "maps.googleapis.com", "geo0.ggpht.com", "geo1.ggpht.com",
+        "geo2.ggpht.com", "geo3.ggpht.com",
+        "placehold.co", "via.placeholder.com",
+    )
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc not in ALLOWED:
+        return jsonify({"error": "Domain không được phép"}), 403
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            content_type = r.headers.get("Content-Type", "image/jpeg")
+            data = r.read()
+
+        if len(_proxy_image_cache) < 300:
+            _proxy_image_cache[url] = (data, content_type)
+
+        b64 = base64.b64encode(data).decode()
+        resp = jsonify({"data": f"data:{content_type};base64,{b64}"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
+    except Exception as e:
+        print(f"[B64 FAIL] {url[:80]} → {e}")
+        return jsonify({"data": ""}), 200
+
+@app.route("/api/activities", methods=["GET"])
+def activities():
+    location   = request.args.get("location", "")
+    query_type = request.args.get("type", "Quán cà phê")
+    results    = get_real_activities(location, query_type)
+    return jsonify({"success": True, "results": results})
+
+
+# ----------------------------------------------------------------
+# 🌤️ THỜI TIẾT
+# ----------------------------------------------------------------
+from weather_service import get_weather as _get_weather
+
+@app.route("/api/weather", methods=["GET"])
+def get_weather():
+    location = request.args.get("location", "").strip()
+    lang     = request.args.get("lang", "vi")
+    if not location:
+        return jsonify({"success": False, "error": "Thiếu tham số location"}), 400
+    result = _get_weather(SERPAPI_KEY, location, lang)
+    # Trả 200 kể cả khi lỗi — tránh frontend retry vô hạn
+    # Chỉ 502 khi lỗi không mong đợi (exception thật)
+    error_code = result.get("error_code", "")
+    if not result.get("success") and error_code not in ("NO_API_KEY", "NO_LOCATION"):
+        status = 502
+    else:
+        status = 200
+    return jsonify(result), status
+
+# ================================================================
+# 🔗 SHARE LINK  —  /trip/<trip_id>
+# ================================================================
+import json, hashlib, time
+
+# In-memory store (thay bằng Redis / DB khi production)
+_trip_store = {}   # { trip_id: { plan, meta, created_at } }
+
+def _gen_id(payload: str) -> str:
+    """8 ký tự hex ngắn gọn, đủ unique cho demo."""
+    h = hashlib.sha256((payload + str(time.time())).encode()).hexdigest()
+    return h[:8]
+
+
+@app.route("/api/trip/save", methods=["POST"])
+def trip_save():
+    """
+    Body JSON:
+      {
+        "plan":        <object>,   # toàn bộ plan từ /api/plan-trip
+        "dailyPlans":  <array>,    # lịch trình từ AiSchedule state
+        "meta": {
+          "location":  "Đà Lạt",
+          "days":      3,
+          "origin":    "TP. Hồ Chí Minh",
+          "startDate": "2026-06-01"
+        }
+      }
+    """
+    try:
+        body = request.get_json(force=True)
+        if not body:
+            return jsonify({"success": False, "error": "Body rỗng"}), 400
+
+        trip_id = _gen_id(json.dumps(body, ensure_ascii=False, sort_keys=True))
+
+        _trip_store[trip_id] = {
+            "plan":       body.get("plan", {}),
+            "dailyPlans": body.get("dailyPlans", []),
+            "meta":       body.get("meta", {}),
+            "created_at": int(time.time()),
+        }
+
+        share_url = f"{request.host_url.rstrip('/')}/trip/{trip_id}"
+        return jsonify({"success": True, "trip_id": trip_id, "share_url": share_url})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/trip/<trip_id>", methods=["GET"])
+def trip_get(trip_id):
+    """Trả về JSON data của trip (dùng cho frontend load lại lịch trình)."""
+    trip = _trip_store.get(trip_id)
+    if not trip:
+        return jsonify({"success": False, "error": "Không tìm thấy lịch trình"}), 404
+    return jsonify({"success": True, **trip})
+
+
+# ================================================================
+# 🌐 OG TAGS — /trip/<trip_id>  (Zalo / Messenger / Facebook share)
+# ================================================================
+
+_OG_TEMPLATE = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- ── Primary meta ── -->
+  <title>{title}</title>
+  <meta name="description" content="{description}">
+
+  <!-- ── Open Graph (Facebook, Messenger, Zalo Web) ── -->
+  <meta property="og:type"        content="website">
+  <meta property="og:url"         content="{url}">
+  <meta property="og:title"       content="{title}">
+  <meta property="og:description" content="{description}">
+  <meta property="og:image"       content="{image}">
+  <meta property="og:image:width"  content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:locale"      content="vi_VN">
+  <meta property="og:site_name"   content="S-Trip · AI Travel Planner">
+
+  <!-- ── Twitter Card ── -->
+  <meta name="twitter:card"        content="summary_large_image">
+  <meta name="twitter:title"       content="{title}">
+  <meta name="twitter:description" content="{description}">
+  <meta name="twitter:image"       content="{image}">
+
+  <!-- ── Redirect sau 1s ── -->
+  <script>
+    setTimeout(function(){{
+      window.location.replace("{app_url}");
+    }}, 800);
+  </script>
+
+  <style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+          background:#f0fdf4;display:flex;align-items:center;justify-content:center;
+          min-height:100vh;padding:20px}}
+    .card{{background:white;border-radius:24px;padding:40px;max-width:480px;
+           text-align:center;box-shadow:0 8px 40px rgba(16,185,129,.15)}}
+    .logo{{font-size:48px;margin-bottom:12px}}
+    h1{{font-size:22px;font-weight:900;color:#111;margin-bottom:8px}}
+    p{{font-size:15px;color:#64748b;line-height:1.5;margin-bottom:24px}}
+    .btn{{display:inline-block;background:#10b981;color:white;padding:14px 32px;
+          border-radius:99px;font-weight:800;font-size:16px;text-decoration:none}}
+    .hint{{font-size:12px;color:#94a3b8;margin-top:16px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">✈️</div>
+    <h1>{title}</h1>
+    <p>{description}</p>
+    <a class="btn" href="{app_url}">Xem lịch trình →</a>
+    <p class="hint">Đang chuyển hướng...</p>
+  </div>
+</body>
+</html>"""
+
+
+@app.route("/trip/<trip_id>", methods=["GET"])
+def trip_share_page(trip_id):
+    """
+    Trang share link — trả HTML với OG tags đầy đủ.
+    Crawler (Zalo/FB/Messenger) đọc OG tags.
+    Browser thật sẽ bị redirect sang app React sau 0.8s.
+    """
+    from flask import Response
+
+    trip = _trip_store.get(trip_id)
+    meta = trip.get("meta", {}) if trip else {}
+
+    location   = meta.get("location", "Điểm đến")
+    days       = meta.get("days", 3)
+    origin     = meta.get("origin", "")
+    start_date = meta.get("startDate", "")
+
+    title = f"🗺️ Lịch trình {days} ngày tại {location} – S-Trip"
+
+    parts = [f"Hành trình {days} ngày {days - 1} đêm tại {location}"]
+    if origin:
+        parts.append(f"khởi hành từ {origin}")
+    if start_date:
+        parts.append(f"ngày {start_date}")
+    description = " · ".join(parts) + ". Xem và tùy chỉnh lịch trình trên S-Trip!"
+
+    # Ảnh OG — dùng ảnh tỉnh từ SerpAPI nếu có, fallback placeholder
+    og_image = (
+        f"{request.host_url.rstrip('/')}/api/og-image/{trip_id}"
+    )
+
+    current_url = request.url
+    # URL app React (đổi thành domain thật khi deploy)
+    app_url = f"http://localhost:3000/trip/{trip_id}"
+
+    if not trip:
+        title       = "S-Trip · AI Travel Planner"
+        description = "Lên kế hoạch du lịch thông minh với AI. Tìm khách sạn, chuyến bay và điểm tham quan chỉ trong vài giây."
+        og_image    = "https://placehold.co/1200x630/10b981/white?text=S-Trip"
+        app_url     = "http://localhost:3000"
+
+    html = _OG_TEMPLATE.format(
+        title=title,
+        description=description,
+        url=current_url,
+        image=og_image,
+        app_url=app_url,
+    )
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/api/og-image/<trip_id>", methods=["GET"])
+def og_image(trip_id):
+    """
+    Trả về ảnh 1200×630 cho OG tag.
+    Thứ tự ưu tiên: ảnh tỉnh từ SerpAPI → placeholder đẹp.
+    """
+    from flask import Response
+    import urllib.request
+
+    trip = _trip_store.get(trip_id)
+    meta = trip.get("meta", {}) if trip else {}
+    location = meta.get("location", "")
+
+    # Thử lấy ảnh tỉnh từ SerpAPI
+    if location and SERPAPI_KEY:
+        try:
+            GoogleSearch = get_google_search()
+            if GoogleSearch:
+                res = GoogleSearch({
+                    "engine": "google_images",
+                    "q": f"du lịch {location} Việt Nam phong cảnh",
+                    "api_key": SERPAPI_KEY,
+                    "num": 1,
+                }).get_dict()
+                imgs = res.get("images_results", [])
+                if imgs:
+                    img_url = imgs[0].get("original") or imgs[0].get("thumbnail")
+                    if img_url:
+                        req = urllib.request.Request(
+                            img_url,
+                            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
+                        )
+                        with urllib.request.urlopen(req, timeout=6) as r:
+                            data = r.read()
+                            ct   = r.headers.get("Content-Type", "image/jpeg")
+                        return Response(data, content_type=ct)
+        except Exception as e:
+            print(f"[og-image] SerpAPI fallback: {e}")
+
+    # Fallback: SVG placeholder 1200×630
+    loc_display = location or "S-Trip"
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#g)"/>
+  <text x="600" y="260" font-family="Arial" font-size="80" font-weight="bold"
+        fill="white" text-anchor="middle">✈️ S-Trip</text>
+  <text x="600" y="360" font-family="Arial" font-size="48"
+        fill="rgba(255,255,255,0.9)" text-anchor="middle">Ha trinh tai {loc_display}</text>
+  <text x="600" y="430" font-family="Arial" font-size="28"
+        fill="rgba(255,255,255,0.7)" text-anchor="middle">AI Travel Planner</text>
+</svg>"""
+    return Response(svg, content_type="image/svg+xml")
+
+
+
+# ================================================================
+# 🗺️  MAP HELPERS — trả URL nhúng map hoặc link mở Google Maps
+# ================================================================
+
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+
+@app.route("/api/map-embed-url", methods=["GET"])
+def map_embed_url():
+    """
+    Trả về URL dùng nhúng <iframe> Google Maps cho 1 địa điểm.
+
+    Ưu tiên:
+      1. place_id (ChIJ...)  → dùng Maps Embed API ?q=place_id:ChIJ...
+      2. lat + lng           → dùng tọa độ
+      3. name + location     → fallback tìm kiếm text
+
+    Query params:
+      place_id  — Google Places ID (ChIJ...)
+      lat, lng  — tọa độ
+      name      — tên địa điểm
+      location  — tỉnh/thành (dùng kết hợp với name)
+    """
+    MAPS_KEY   = GOOGLE_MAPS_API_KEY
+    place_id   = request.args.get("place_id", "").strip()
+    lat        = request.args.get("lat", "").strip()
+    lng        = request.args.get("lng", "").strip()
+    name       = request.args.get("name", "").strip()
+    location   = request.args.get("location", "").strip()
+
+    # Trường hợp 1: có place_id chuẩn
+    if place_id and not place_id.startswith("0x") and MAPS_KEY:
+        embed = (
+            f"https://www.google.com/maps/embed/v1/place"
+            f"?key={MAPS_KEY}&q=place_id:{urllib.parse.quote(place_id)}&language=vi"
+        )
+        return jsonify({"success": True, "embed_url": embed, "source": "place_id"})
+
+    # Trường hợp 2: có tọa độ
+    if lat and lng and MAPS_KEY:
+        label = urllib.parse.quote(name or location or "Địa điểm")
+        embed = (
+            f"https://www.google.com/maps/embed/v1/place"
+            f"?key={MAPS_KEY}&q={label}&center={lat},{lng}&zoom=16&language=vi"
+        )
+        return jsonify({"success": True, "embed_url": embed, "source": "latlng"})
+
+    # Trường hợp 3: fallback tìm kiếm text
+    if (name or location) and MAPS_KEY:
+        q = urllib.parse.quote(f"{name} {location}".strip())
+        embed = (
+            f"https://www.google.com/maps/embed/v1/search"
+            f"?key={MAPS_KEY}&q={q}&language=vi"
+        )
+        return jsonify({"success": True, "embed_url": embed, "source": "search"})
+
+    # Không có API key hoặc không đủ thông tin → trả link mở Maps thường
+    if lat and lng:
+        link = f"https://www.google.com/maps?q={lat},{lng}"
+    elif name:
+        link = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(name + ' ' + location)}"
+    else:
+        link = "https://www.google.com/maps"
+
+    return jsonify({"success": False, "maps_link": link, "reason": "Thiếu GOOGLE_MAPS_API_KEY hoặc thiếu thông tin"})
+
+
+@app.route("/api/static-map", methods=["GET"])
+def static_map():
+    """
+    Trả URL ảnh bản đồ tĩnh (Static Maps API) cho thumbnail map.
+    Dùng khi không muốn nhúng iframe.
+
+    Query params: lat, lng, zoom (default 15), size (default 400x250)
+    """
+    lat  = request.args.get("lat", "")
+    lng  = request.args.get("lng", "")
+    zoom = request.args.get("zoom", "15")
+    size = request.args.get("size", "400x250")
+    MAPS_KEY = GOOGLE_MAPS_API_KEY
+
+    if not lat or not lng:
+        return jsonify({"success": False, "error": "Thiếu lat/lng"}), 400
+
+    if not MAPS_KEY:
+        # Fallback: ảnh tile OpenStreetMap (không cần key)
+        osm_url = (
+            f"https://staticmap.openstreetmap.de/staticmap.php"
+            f"?center={lat},{lng}&zoom={zoom}&size={size}&markers={lat},{lng}"
+        )
+        return jsonify({"success": True, "url": osm_url, "source": "osm"})
+
+    url = (
+        f"https://maps.googleapis.com/maps/api/staticmap"
+        f"?center={lat},{lng}&zoom={zoom}&size={size}"
+        f"&markers=color:red%7C{lat},{lng}&key={MAPS_KEY}&language=vi"
+    )
+    return jsonify({"success": True, "url": url, "source": "google"})
+
+
+# ================================================================
+# 🔖 LƯU TRỮ ĐỊA ĐIỂM — /api/saved-places (ĐÃ CONFIG LƯU FILE JSON VĨNH VIỄN)
+# ================================================================
+import json
+
+SAVED_PLACES_FILE = "saved_places_db.json"
+
+def _load_saved_places():
+    """Đọc dữ liệu từ file JSON cục bộ lên RAM khi khởi động server"""
+    if os.path.exists(SAVED_PLACES_FILE):
+        try:
+            with open(SAVED_PLACES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_saved_places(data):
+    """Ghi dữ liệu từ RAM xuống file JSON vĩnh viễn trên ổ cứng"""
+    try:
+        with open(SAVED_PLACES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Lỗi ghi file lưu trữ: {e}")
+
+# Khởi tạo bộ nhớ từ file JSON thay vì Object rỗng
+_saved_places_store = _load_saved_places()
+
+def _sp_get_uid():
+    from flask import session
+    return session.get("user_id")
+
+def _sp_next_id(uid: str) -> int:
+    """Tự động tìm ID lớn nhất của user rồi + 1, không dùng counter RAM cũ"""
+    places = _saved_places_store.get(uid, [])
+    if not places:
+        return 1
+    return max(p.get("id", 0) for p in places) + 1
+
+
+@app.route("/api/saved-places", methods=["GET"])
+def saved_places_list():
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    places = _saved_places_store.get(str(uid), [])
+    return jsonify({"success": True, "savedPlaces": places, "places": places})
+
+
+@app.route("/api/saved-places", methods=["POST"])
+def saved_places_add():
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+
+    data     = request.get_json(force=True) or {}
+    name     = (data.get("name",     "") or "").strip()
+    location = (data.get("location", "") or "").strip()
+
+    if not name:
+        return jsonify({"success": False, "error": "Thiếu tên địa điểm"}), 400
+
+    key = str(uid)
+    if key not in _saved_places_store:
+        _saved_places_store[key] = []
+
+    for p in _saved_places_store[key]:
+        if p.get("name") == name and p.get("location") == location:
+            return jsonify({"success": True, "message": "Đã lưu trước đó", "id": p.get("id")})
+
+    new_id = _sp_next_id(key)
+    _saved_places_store[key].append({
+        "id":        new_id,
+        "name":      name,
+        "location":  location,
+        "rating":    data.get("rating",    ""),
+        "thumbnail": data.get("thumbnail", ""),
+        "type":      data.get("type",      "default"),
+        "saved_at":  int(time.time()),
+    })
+    
+    _save_saved_places(_saved_places_store) # 💾 Đồng bộ lưu xuống file
+    return jsonify({"success": True, "id": new_id})
+
+
+@app.route("/api/saved-places/check", methods=["GET"])
+def saved_places_check():
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"exists": False})
+
+    name     = request.args.get("name",     "").strip()
+    location = request.args.get("location", "").strip()
+    places   = _saved_places_store.get(str(uid), [])
+    exists   = any(
+        p.get("name") == name and p.get("location") == location
+        for p in places
+    )
+    return jsonify({"exists": exists})
+
+
+@app.route("/api/saved-places/remove-by-name", methods=["POST"])
+def saved_places_remove_by_name():
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+
+    data     = request.get_json(force=True) or {}
+    name     = (data.get("name",     "") or "").strip()
+    location = (data.get("location", "") or "").strip()
+
+    key    = str(uid)
+    before = _saved_places_store.get(key, [])
+    after  = [
+        p for p in before
+        if not (p.get("name") == name and p.get("location") == location)
+    ]
+    _saved_places_store[key] = after
+    removed = len(before) - len(after)
+    
+    _save_saved_places(_saved_places_store) # 💾 Cập nhật file sau khi bỏ bookmark
+    return jsonify({"success": True, "removed": removed})
+
+
+@app.route("/api/saved-places/<int:place_id>", methods=["DELETE"])
+def saved_places_delete(place_id):
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+
+    key    = str(uid)
+    before = _saved_places_store.get(key, [])
+    after  = [p for p in before if p.get("id") != place_id]
+
+    if len(before) == len(after):
+        return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
+
+    _saved_places_store[key] = after
+    _save_saved_places(_saved_places_store) # 💾 Cập nhật file sau khi click nút xóa card
+    return jsonify({"success": True})
+
+
+@app.route("/api/saved-places/<int:place_id>", methods=["PUT"])
+def saved_places_update(place_id):
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+
+    data = request.get_json(force=True) or {}
+    new_thumbnail = data.get("thumbnail", "")
+
+    key = str(uid)
+    places = _saved_places_store.get(key, [])
+    
+    for p in places:
+        if p.get("id") == place_id:
+            p["thumbnail"] = to_proxy_url(new_thumbnail)
+            _save_saved_places(_saved_places_store) # 💾 Lưu đè ảnh nét vĩnh viễn xuống ổ cứng
+            return jsonify({"success": True, "message": "Đã lưu vĩnh viễn ảnh nét vào bộ nhớ"})
+
+    return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
 
 
 if __name__ == "__main__":
