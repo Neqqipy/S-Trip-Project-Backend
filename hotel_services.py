@@ -11,6 +11,17 @@ GOOGLE_IMG_DOMAINS = (
     "googleapis.com", "googleapi",
 )
 
+# Hard-cap tuyệt đối: không bao giờ trả hotel xa hơn ngưỡng này dù fallback
+# FIX 2: giá trị này ngăn hotel 400-500km lọt qua khi filter_hotels_in_bounds
+# chạy fallback sort-by-distance mà không có giới hạn tuyệt đối.
+MAX_ABSOLUTE_KM = 50
+
+# Zoom level dùng khi truyền tọa độ vào SerpAPI (ll= param).
+# 12z ≈ bán kính ~15-20km tính từ tâm — đủ bao phủ khu du lịch mà không lấy
+# hotel tỉnh bên cạnh.
+# FIX 1: thiếu param này khiến SerpAPI trả hotel ở tỉnh liền kề hoặc xa hơn.
+SERPAPI_ZOOM = 12
+
 # --- CACHE ẢNH: tránh gọi lại SerpAPI cho cùng khách sạn ---
 IMG_CACHE_FILE = "hotel_img_cache.json"
 
@@ -362,7 +373,7 @@ def filter_hotels_in_bounds(hotels, location, max_km=10, tours=None, foods=None)
       - Hotel không có tọa độ → giữ lại (để frontend geocode sau)
       - Lọc với radius max_km; nếu còn < 3 → tự động nới rộng lên max_km * 2
       - Sau khi nới vẫn không đủ → sort theo khoảng cách, trả top gần nhất
-        (thay vì trả nguyên list gốc không liên quan)
+        nhưng KHÔNG vượt quá MAX_ABSOLUTE_KM (FIX 2: ngăn hotel 400-500km lọt vào)
     """
     if not hotels:
         return hotels
@@ -411,7 +422,7 @@ def filter_hotels_in_bounds(hotels, location, max_km=10, tours=None, foods=None)
     filtered = _apply_radius(max_km)
     print(f"[filter_hotels] {len(filtered)}/{len(hotels)} hotel trong phạm vi {max_km}km.")
 
-    # FIX 2: Adaptive radius — nới rộng gấp đôi nếu còn < 3 kết quả có tọa độ
+    # Adaptive radius — nới rộng gấp đôi nếu còn < 3 kết quả có tọa độ
     hotels_with_coords = [h for h in filtered if h.get("lat") is not None]
     if len(hotels_with_coords) < 3:
         expanded_km = max_km * 2
@@ -419,16 +430,41 @@ def filter_hotels_in_bounds(hotels, location, max_km=10, tours=None, foods=None)
         filtered = _apply_radius(expanded_km)
         print(f"[filter_hotels] Sau nới rộng: {len(filtered)}/{len(hotels)} hotel trong phạm vi {expanded_km}km.")
 
-    # FIX 3: Fallback thông minh — sort theo khoảng cách thay vì trả nguyên list gốc
+    # FIX 2: Fallback thông minh với hard-cap tuyệt đối MAX_ABSOLUTE_KM.
+    # Phiên bản cũ: return sorted_hotels[:10] không giới hạn khoảng cách
+    # → hotel 400-500km lọt vào nếu SerpAPI trả kết quả xa.
+    # Phiên bản mới: chỉ lấy hotel trong vòng MAX_ABSOLUTE_KM, dù có bao nhiêu kết quả.
     if not filtered:
-        print(f"[filter_hotels] Lọc hết sạch → fallback sort theo khoảng cách gần nhất.")
+        print(f"[filter_hotels] Lọc hết sạch → fallback sort theo khoảng cách, hard-cap {MAX_ABSOLUTE_KM}km.")
+
         def sort_key(h):
             d = _dist(h)
             return d if d is not None else float("inf")
-        sorted_hotels = sorted(hotels, key=sort_key)
-        top = sorted_hotels[:10]
+
+        within_cap = [
+            h for h in sorted(hotels, key=sort_key)
+            if (_dist(h) or float("inf")) <= MAX_ABSOLUTE_KM
+        ]
+
+        if not within_cap:
+            nearest = sorted(hotels, key=sort_key)
+            nearest_dist = _dist(nearest[0]) if nearest else None
+            print(
+                f"[filter_hotels] Không có hotel nào trong {MAX_ABSOLUTE_KM}km "
+                f"(gần nhất: {nearest_dist:.1f}km) — trả danh sách rỗng."
+                if nearest_dist else
+                f"[filter_hotels] Không có hotel nào trong {MAX_ABSOLUTE_KM}km — trả danh sách rỗng."
+            )
+            return []
+
+        top = within_cap[:10]
         nearest_dist = _dist(top[0]) if top else None
-        print(f"[filter_hotels] Trả {len(top)} hotel gần nhất (gần nhất: {nearest_dist:.1f}km)." if nearest_dist else f"[filter_hotels] Trả {len(top)} hotel.")
+        print(
+            f"[filter_hotels] Trả {len(top)} hotel gần nhất trong hard-cap "
+            f"(gần nhất: {nearest_dist:.1f}km)."
+            if nearest_dist else
+            f"[filter_hotels] Trả {len(top)} hotel."
+        )
         return top
 
     return filtered
@@ -436,14 +472,19 @@ def filter_hotels_in_bounds(hotels, location, max_km=10, tours=None, foods=None)
 
 def get_smart_hotel_recommendations(api_key, location, total_hotel_budget,
                                     num_days, passengers, departure_date=None,
-                                    tours=None, foods=None):
+                                    tours=None, foods=None, center_hint=None):
     """
     Lấy danh sách khách sạn từ SerpAPI, parse, lọc theo khu vực thực tế,
     rồi uỷ toàn bộ việc chấm điểm + chọn lọc cho `score_hotels()`.
 
     Args:
-        tours, foods: list địa điểm đã fetch — dùng để tính trung tâm thực tế,
-                      thay vì geocode tên tỉnh (tránh lệch như Quảng Nam → Tam Kỳ)
+        tours, foods  : list địa điểm đã fetch — dùng để tính trung tâm thực tế,
+                        thay vì geocode tên tỉnh (tránh lệch như Quảng Nam → Tam Kỳ)
+        center_hint   : (lat, lng) tính sẵn từ bên ngoài (VD: geocode tỉnh khi gọi API
+                        trước khi tours/foods sẵn sàng). Dùng làm fallback khi
+                        tours/foods chưa đủ điểm để tính centroid.
+                        FIX 3: tránh Nominatim trả tọa độ tỉnh lỵ hành chính không
+                        khớp khu du lịch thực tế (Quảng Nam → Tam Kỳ thay vì Hội An).
 
     Returns:
         list[dict] — top 5 khách sạn, đã có trường 'score', sắp xếp điểm cao xuống thấp
@@ -461,6 +502,20 @@ def get_smart_hotel_recommendations(api_key, location, total_hotel_budget,
     max_per_night   = total_hotel_budget / max(num_nights, 1)
     floor_per_night = max(int(max_per_night * 0.25), 200_000)
 
+    # FIX 1 + FIX 3: Tính center TRƯỚC khi gọi SerpAPI để:
+    #   (a) Truyền ll= vào params → ràng buộc cứng khu vực ngay từ đầu (Fix 1)
+    #   (b) Cung cấp center chính xác cho filter_hotels_in_bounds (Fix 3)
+    #
+    # Thứ tự ưu tiên:
+    #   1. Centroid từ tours+foods (chính xác nhất — điểm tham quan thực tế)
+    #   2. center_hint từ caller (geocode tỉnh sớm, truyền vào từ ngoài)
+    #   3. Nominatim geocode tại đây (tốt hơn để trống, nhưng kém chính xác)
+    center = (
+        _get_center_from_activities(tours, foods)
+        or center_hint
+        or _get_location_center_nominatim(location)
+    )
+
     params = {
         "engine":          "google_hotels",
         "q":               f"Hotels in {location}, Vietnam",
@@ -475,7 +530,20 @@ def get_smart_hotel_recommendations(api_key, location, total_hotel_budget,
         "num":             20,                      # POOL: lấy nhiều hơn để score_hotels có đủ lựa chọn
         "api_key":         api_key,
     }
-    print(f"[hotels] Tìm tại '{location}' | ngân sách/đêm: {max_per_night:,.0f}đ | sàn giá: {floor_per_night:,.0f}đ")
+
+    # FIX 1: Truyền tọa độ trực tiếp vào SerpAPI qua param ll=@lat,lng,{zoom}z.
+    # Đây là ràng buộc địa lý cứng ở cấp API — ngăn SerpAPI trả hotel ở tỉnh
+    # liền kề hoặc xa hơn trước khi data về local filter.
+    # Không có param này, SerpAPI chỉ dùng "location" như một bias yếu,
+    # dẫn đến hotel 400-500km lọt vào pool.
+    if center:
+        params["ll"] = f"@{center[0]},{center[1]},{SERPAPI_ZOOM}z"
+        print(
+            f"[hotels] Tìm tại '{location}' | center=({center[0]:.4f},{center[1]:.4f}) "
+            f"zoom={SERPAPI_ZOOM} | ngân sách/đêm: {max_per_night:,.0f}đ | sàn giá: {floor_per_night:,.0f}đ"
+        )
+    else:
+        print(f"[hotels] Tìm tại '{location}' | không có center | ngân sách/đêm: {max_per_night:,.0f}đ | sàn giá: {floor_per_night:,.0f}đ")
 
     try:
         raw_hotels = GoogleSearch(params).get_dict().get("properties", [])
@@ -495,11 +563,10 @@ def get_smart_hotel_recommendations(api_key, location, total_hotel_budget,
     # ✅ Lọc theo trung tâm thực tế (tours+foods) thay vì trung tâm hành chính tỉnh
     parsed = filter_hotels_in_bounds(parsed, location, max_km=10, tours=tours, foods=foods)
 
-    # Fix 2: Tính proximity blend TRƯỚC khi score_hotels để max_dist chuẩn hoá
+    # Tính proximity blend TRƯỚC khi score_hotels để max_dist chuẩn hoá
     # trên toàn bộ pool (không phải top-5), tránh skew khi top-5 đều gần nhau.
-    center = _get_center_from_activities(tours, foods)
     if not center:
-        center = _get_location_center_nominatim(location)
+        center = _get_center_from_activities(tours, foods) or _get_location_center_nominatim(location)
 
     if center and parsed:
         clat, clng = center

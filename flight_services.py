@@ -232,22 +232,22 @@ def is_route_operated(iata_a: str, iata_b: str) -> bool:
 # ---------------------------------------------------------------------------
 _IATA_HUB_CANDIDATES: dict[str, list[str]] = {
     # Miền Nam
-    "CAH": ["SGN"],
-    "VCA": ["SGN"],
-    "VKG": ["SGN"],
+    "CAH": ["VCA", "SGN"],          # Cà Mau → Cần Thơ hoặc SGN
+    "VCA": ["SGN", "HAN"],
+    "VKG": ["PQC", "SGN"],          # Rạch Giá → Phú Quốc hoặc SGN
     "PQC": ["SGN", "HAN"],
     # Miền Trung - Nam
     "PHH": ["SGN", "HAN"],
     "DLI": ["SGN", "HAN"],
-    "BMV": ["SGN", "HAN"],
-    "PXU": ["SGN", "HAN"],
+    "BMV": ["SGN", "HAN", "DAD"],
+    "PXU": ["SGN", "HAN", "DAD"],
     "UIH": ["SGN", "DAD", "HAN"],
-    "TBB": ["SGN", "DAD", "HAN"],
-    "VCL": ["DAD", "SGN", "HAN"],
+    "TBB": ["CXR", "SGN", "HAN"],   # Tuy Hòa → Nha Trang (CXR) gần hơn
+    "VCL": ["DAD", "SGN", "HAN"],   # Chu Lai → Đà Nẵng
     # Miền Bắc
     "DIN": ["HAN"],
     "SQH": ["HAN"],
-    "VDH": ["HAN", "DAD"],
+    "VDH": ["HUI", "HAN", "DAD"],   # Đồng Hới → Huế hoặc HAN
     "VII": ["HAN", "DAD"],
 }
 
@@ -696,43 +696,122 @@ def get_smart_flight_recommendations(
             return []
 
     try:
-        # Thử ngày yêu cầu trước
+        # Chỉ tìm đúng ngày yêu cầu — không fallback sang ngày khác để tránh tốn thêm API
         flights = _fetch_flights_for_date(outbound_dt)
         if flights:
             return flights
 
-        # Không có vé ngày đó — thử 3 ngày tiếp theo
-        print(f"[Flight] Không có vé ngày {outbound_dt.strftime('%Y-%m-%d')}, thử 3 ngày tiếp theo...")
-        requested_date_str = outbound_dt.strftime("%d/%m/%Y")
-        for delta in range(1, 4):
-            check_dt = outbound_dt + timedelta(days=delta)
-            flights = _fetch_flights_for_date(check_dt)
-            if flights:
-                alt_date_str = check_dt.strftime("%d/%m/%Y")
-                print(f"[Flight] ✅ Tìm thấy vé vào ngày {alt_date_str}")
-                # Gắn thông báo vào từng chuyến bay
-                for f in flights:
-                    f["alt_date_note"] = (
-                        f"Ngày {requested_date_str} không có vé — "
-                        f"chuyến gần nhất vào ngày {alt_date_str} (tham khảo)"
-                    )
-                    f["alt_date"] = check_dt.strftime("%Y-%m-%d")
-                return flights
+        print(f"[Flight] ❌ Không có vé ngày {outbound_dt.strftime('%Y-%m-%d')} cho {departure_id.upper()}→{arrival_id.upper()}")
 
-        # 7 ngày đều không có vé
-        print(f"[Flight] ❌ Không có vé trong 7 ngày kể từ {outbound_dt.strftime('%Y-%m-%d')}")
-        return [{
-            "no_flights_note": (
-                f"Không tìm thấy vé {departure_id.upper()}→{arrival_id.upper()} "
-                f"trong 3 ngày từ {requested_date_str}. Vui lòng chọn ngày khác."
-            ),
-            "airline": "", "price": 0, "thumbnail": "", "duration": "",
-            "duration_mins": 0, "ticket_class": "", "stops": "",
-            "departure": "", "arrival": "",
-        }]
+        # ---------------------------------------------------------------------------
+        # 🔀 FALLBACK HUB: thử hub thay thế khi tuyến thực tế không có vé
+        # ---------------------------------------------------------------------------
+        dep_upper = departure_id.upper()
+        arr_upper = arrival_id.upper()
+
+        # Hub fallback cho arrival (bay vào hub gần điểm đến)
+        arr_hubs = [h for h in _IATA_HUB_CANDIDATES.get(arr_upper, [])
+                    if h != arr_upper and h != dep_upper and is_route_operated(dep_upper, h)]
+        for hub in arr_hubs:
+            print(f"[Flight] 🔀 Thử fallback arrival hub: {dep_upper} → {hub} (thay vì {arr_upper})")
+            fallback = _fetch_flights_for_date_iata(dep_upper, hub, outbound_dt, passengers, api_key)
+            if fallback:
+                for f in fallback:
+                    f["hub_fallback"] = hub
+                    f["hub_fallback_note"] = f"Không có vé thẳng đến {arr_upper}. Đây là vé đến {hub} (hub gần nhất)."
+                return fallback
+
+        # Hub fallback cho departure (bay từ hub gần điểm xuất phát)
+        dep_hubs = [h for h in _IATA_HUB_CANDIDATES.get(dep_upper, [])
+                    if h != dep_upper and h != arr_upper and is_route_operated(h, arr_upper)]
+        for hub in dep_hubs:
+            print(f"[Flight] 🔀 Thử fallback departure hub: {hub} → {arr_upper} (thay vì {dep_upper})")
+            fallback = _fetch_flights_for_date_iata(hub, arr_upper, outbound_dt, passengers, api_key)
+            if fallback:
+                for f in fallback:
+                    f["hub_fallback"] = hub
+                    f["hub_fallback_note"] = f"Không có vé thẳng từ {dep_upper}. Đây là vé từ {hub} (hub gần nhất)."
+                return fallback
+
+        print(f"[Flight] ❌ Không tìm được vé kể cả qua hub fallback — trả về []")
+        return []
 
     except Exception as e:
         print(f"[Flight] Lỗi không mong đợi: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 🔧 HELPER NỘI BỘ: GỌI SERPAPI CHO CẶP IATA BẤT KỲ (dùng trong hub fallback)
+# ---------------------------------------------------------------------------
+
+def _fetch_flights_for_date_iata(
+    departure_id: str, arrival_id: str, dt: "datetime", passengers: int, api_key: str
+) -> list:
+    """
+    Gọi SerpAPI cho cặp IATA + ngày cụ thể.
+    Tách riêng để tái sử dụng trong logic hub fallback.
+    Trả về list chuyến bay đã parse (tối đa 2), hoặc [].
+    """
+    params = {
+        "engine":        "google_flights",
+        "departure_id":  departure_id.upper(),
+        "arrival_id":    arrival_id.upper(),
+        "outbound_date": dt.strftime("%Y-%m-%d"),
+        "type":          "2",
+        "currency":      "VND",
+        "hl":            "vi",
+        "gl":            "vn",
+        "adults":        passengers,
+        "api_key":       api_key,
+    }
+    print(f"[Flight][FallbackHelper] {departure_id.upper()}→{arrival_id.upper()} ngày {dt.strftime('%Y-%m-%d')}")
+    try:
+        results = GoogleSearch(params).get_dict()
+        if "error" in results:
+            print(f"[Flight][FallbackHelper] ❌ SerpAPI error: {results['error']}")
+            return []
+        best  = results.get("best_flights", [])
+        other = results.get("other_flights", [])
+        raw   = best + other or results.get("flights", [])
+        if not raw:
+            return []
+        parsed = []
+        for f in raw:
+            price = f.get("price", 0)
+            if price <= 0:
+                continue
+            leg = f.get("flights", [{}])[0]
+            dur = f.get("total_duration", 0)
+            h, m = divmod(dur, 60)
+            parsed.append({
+                "airline":       leg.get("airline", ""),
+                "price":         price,
+                "thumbnail":     leg.get("airline_logo", ""),
+                "duration":      f"{h}h{m}m" if m else f"{h}h",
+                "duration_mins": dur,
+                "ticket_class":  leg.get("travel_class", "Phổ thông"),
+                "stops":         "Bay thẳng" if len(f.get("flights", [])) - 1 == 0 else f"{len(f.get('flights', [])) - 1} điểm dừng",
+                "departure":     leg.get("departure_airport", {}).get("time", ""),
+                "arrival":       leg.get("arrival_airport", {}).get("time", ""),
+            })
+        parsed.sort(key=lambda x: (x["price"], x.get("duration_mins", 9999)))
+        seen, final = {}, []
+        for f in parsed:
+            if f["airline"] not in seen:
+                seen[f["airline"]] = True
+                final.append(f)
+            if len(final) == 2:
+                break
+        if len(final) < 2:
+            for f in parsed:
+                if f not in final:
+                    final.append(f)
+                if len(final) == 2:
+                    break
+        return final[:2]
+    except Exception as e:
+        print(f"[Flight][FallbackHelper] Lỗi: {e}")
         return []
 
 

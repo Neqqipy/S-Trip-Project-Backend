@@ -226,7 +226,8 @@ _PROVINCE_INFO: dict[str, dict] = {
     "tuy hòa":       {"iata": "TBB", "hub": None,          "hub_km": 0,   "train": "Tuy Hòa"},
     "buôn ma thuột": {"iata": "BMV", "hub": "hồ chí minh", "hub_km": 350, "train": None},
     "nha trang":     {"iata": "CXR", "hub": None,          "hub_km": 0,   "train": "Nha Trang"},
-    "phan thiết":    {"iata": None,  "hub": "hồ chí minh", "hub_km": 200, "train": "Mương Mán"},
+    "phan thiết":    {"iata": None,  "hub": "hồ chí minh", "hub_km": 200, "train": "Mương Mán"},  # PHH ngừng khai thác thương mại
+    "ninh thuận":    {"iata": "CXR", "hub": "nha trang",   "hub_km": 60,  "train": "Tháp Chàm"},  # Ninh Thuận → CXR (Cam Ranh)
     "gia lai":       {"iata": "PXU", "hub": "đà nẵng",     "hub_km": 200, "train": None},
     "đà lạt":        {"iata": "DLI", "hub": "hồ chí minh", "hub_km": 300, "train": None},
     # MIỀN NAM
@@ -564,16 +565,27 @@ def _build_flight_options(
         if not needs_origin_transfer and not needs_dest_transfer:
             for i, f in enumerate(valid_flights[:3]):
                 alt_note = f.get("alt_date_note", "")
+                hub_note = f.get("hub_fallback_note", "")
                 tips = f"{f['stops']} • {f['departure']}-{f['arrival']}."
-                if alt_note:
+                if hub_note:
+                    tips = f"⚠️ {hub_note} | {tips}"
+                elif alt_note:
                     tips = f"⚠️ {alt_note} | {tips}"
+                # Nếu là hub fallback thì dùng IATA thực tế của chuyến bay
+                actual_arr = f.get("hub_fallback", d_iata)
+                flight_label = (
+                    f"Máy bay {f['airline']} ({o_iata} → {actual_arr})"
+                    if actual_arr != d_iata
+                    else f"Máy bay {f['airline']} ({o_iata} → {d_iata})"
+                )
                 options.append({
-                    "label": f"Máy bay {f['airline']} ({o_iata} → {d_iata})", "type": "flight",
+                    "label": flight_label, "type": "flight",
                     "duration": f["duration"], "price_range": f"{int(f['price']):,} VNĐ".replace(",", "."),
                     "distance": dist_str, "ticket_type": f"Hạng {f['ticket_class']}",
                     "thumbnail": f.get("thumbnail", ""), "tips": tips,
                     "recommended": (i == 0),
                     **({"alt_date": f["alt_date"], "alt_date_note": alt_note} if alt_note else {}),
+                    **({"hub_fallback": actual_arr, "hub_fallback_note": hub_note} if hub_note else {}),
                 })
         else:
             for i, f in enumerate(valid_flights[:2]):
@@ -585,22 +597,30 @@ def _build_flight_options(
                     total_extra += (lo + hi) // 2
                     legs.append({"step": step, "icon": "🚗", "mode": "car", "label": f"Xe ra sân bay {o_iata}", "duration": ds, "price_range": ps, "tips": "Từ trung tâm.", "distance": f"~{origin_hub_km} km"})
                     step += 1
+                actual_arr = f.get("hub_fallback", d_iata)
                 legs.append({"step": step, "icon": "✈️", "mode": "flight", "label": f"Bay {f['airline']}", "duration": f["duration"], "price_range": f"{int(f['price']):,} VNĐ".replace(",", "."), "tips": f"{f['departure']} → {f['arrival']}.", "distance": dist_str, "thumbnail": f.get("thumbnail", "")})
                 step += 1
                 if needs_dest_transfer:
                     lo, hi, ps, ds = _transfer_cost_km(dest_hub_km)
                     total_extra += (lo + hi) // 2
-                    legs.append({"step": step, "icon": "🚗", "mode": "car", "label": f"Xe từ {d_iata} về đích", "duration": ds, "price_range": ps, "tips": "Taxi/Grab.", "distance": f"~{dest_hub_km} km"})
+                    legs.append({"step": step, "icon": "🚗", "mode": "car", "label": f"Xe từ {actual_arr} về đích", "duration": ds, "price_range": ps, "tips": "Taxi/Grab.", "distance": f"~{dest_hub_km} km"})
 
                 alt_note = f.get("alt_date_note", "")
+                hub_note = f.get("hub_fallback_note", "")
+                combined_note = " | ".join(filter(None, [
+                    f"⚠️ {hub_note}" if hub_note else "",
+                    f"⚠️ {alt_note}" if alt_note else "",
+                    "Giá gộp vé và xe.",
+                ])).lstrip(" | ")
                 options.append({
-                    "label": _transfer_flight_label(o_iata, d_iata, needs_origin_transfer, needs_dest_transfer),
+                    "label": _transfer_flight_label(o_iata, actual_arr, needs_origin_transfer, needs_dest_transfer),
                     "type": "combined",
                     "duration": f"Bay {f['duration']} + xe", "price_range": f"~{(int(f['price']) + total_extra):,} VNĐ".replace(",", "."),
                     "distance": dist_str, "ticket_type": f"Hạng {f['ticket_class']}", "thumbnail": f.get("thumbnail", ""),
-                    "tips": f"⚠️ {alt_note} | Giá gộp vé và xe." if alt_note else "Giá gộp vé và xe.",
+                    "tips": combined_note,
                     "recommended": (i == 0), "legs": legs,
                     **({"alt_date": f["alt_date"], "alt_date_note": alt_note} if alt_note else {}),
+                    **({"hub_fallback": actual_arr, "hub_fallback_note": hub_note} if hub_note else {}),
                 })
     else:
         # Ước tính giá tham khảo theo khoảng cách

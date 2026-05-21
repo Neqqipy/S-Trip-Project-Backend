@@ -9,7 +9,7 @@ W_PRICE    = 0.15
 W_RATING   = 0.35
 
 W_HOTEL_QUALITY = 0.55   # trọng số chất lượng (Bayesian rating) cho khách sạn
-W_HOTEL_PRICE   = 0.45   # trọng số giá phù hợp ngân sách (tăng để tránh chọn phèn)
+W_HOTEL_PRICE   = 0.45   # trọng số giá phù hợp ngân sách
 
 # Ngưỡng giá sàn: khách sạn rẻ hơn X% ngân sách/đêm bị coi là "phèn"
 PRICE_FLOOR_RATIO = 0.25   # dưới 25% max_per_night → điểm giá = 0
