@@ -1,118 +1,109 @@
 ﻿# auth_routes.py
 # ================================================================
-# 🔐 AUTH + SCHEDULE + PROFILE — Blueprint Flask
+# 🔐 AUTH + SCHEDULE + PROFILE — Blueprint Flask (Supabase)
+# ================================================================
+#
+# Bảng cần tạo trên Supabase (SQL Editor):
+#
+# CREATE TABLE users (
+#     id            BIGSERIAL PRIMARY KEY,
+#     email         TEXT UNIQUE NOT NULL,
+#     password_hash TEXT,
+#     name          TEXT NOT NULL DEFAULT '',
+#     avatar        TEXT DEFAULT '',
+#     google_id     TEXT UNIQUE,
+#     created_at    TIMESTAMPTZ DEFAULT NOW()
+# );
+#
+# CREATE TABLE schedules (
+#     id         BIGSERIAL PRIMARY KEY,
+#     user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#     title      TEXT NOT NULL DEFAULT 'Lịch trình',
+#     location   TEXT NOT NULL DEFAULT '',
+#     days       INT  NOT NULL DEFAULT 3,
+#     data_json  JSONB NOT NULL DEFAULT '{}',
+#     created_at TIMESTAMPTZ DEFAULT NOW(),
+#     updated_at TIMESTAMPTZ DEFAULT NOW()
+# );
+# CREATE INDEX idx_schedules_user_id ON schedules(user_id);
+#
+# CREATE TABLE favorites (
+#     id         BIGSERIAL PRIMARY KEY,
+#     user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#     name       TEXT NOT NULL,
+#     location   TEXT DEFAULT '',
+#     rating     TEXT DEFAULT '',
+#     thumbnail  TEXT DEFAULT '',
+#     type       TEXT DEFAULT 'default',
+#     created_at TIMESTAMPTZ DEFAULT NOW()
+# );
+# CREATE INDEX idx_favorites_user_id ON favorites(user_id);
+#
 # ================================================================
 
-import os, sqlite3, bcrypt, json, secrets
-from datetime import datetime
+import os, bcrypt, json, time
+from datetime import datetime, timezone
 from functools import wraps
 from flask import Blueprint, request, jsonify, session, redirect, url_for
 from authlib.integrations.flask_client import OAuth
 from werkzeug.utils import secure_filename
+from supabase import create_client, Client as SupabaseClient
 
 auth_bp = Blueprint("auth", __name__)
 
 # ----------------------------------------------------------------
 # ⚙️ CONFIG
 # ----------------------------------------------------------------
-DB_PATH = os.path.join(os.path.dirname(__file__), "strip.db")
-
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
-# URL frontend React (đổi khi deploy)
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-# Thư mục lưu avatar
+# Thư mục lưu avatar local (fallback khi chưa có cloud storage)
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "static", "avatars")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Định dạng file ảnh được phép upload
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # ----------------------------------------------------------------
-# 🗄️ KHỞI TẠO DATABASE
+# 🔌 SUPABASE CLIENT
 # ----------------------------------------------------------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+_sb: SupabaseClient | None = None
 
-def init_db():
-    """Tạo bảng nếu chưa có. Gọi khi app khởi động."""
-    with get_db() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                email        TEXT    UNIQUE NOT NULL,
-                password_hash TEXT,
-                name         TEXT    NOT NULL DEFAULT '',
-                avatar       TEXT    DEFAULT '',
-                google_id    TEXT    UNIQUE,
-                created_at   TEXT    DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS schedules (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                title        TEXT    NOT NULL DEFAULT 'Lịch trình',
-                location     TEXT    NOT NULL DEFAULT '',
-                days         INTEGER NOT NULL DEFAULT 3,
-                data_json    TEXT    NOT NULL DEFAULT '{}',
-                created_at   TEXT    DEFAULT (datetime('now')),
-                updated_at   TEXT    DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS favorites (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                name        TEXT    NOT NULL,
-                location    TEXT    DEFAULT '',
-                rating      TEXT    DEFAULT '',
-                thumbnail   TEXT    DEFAULT '',
-                type        TEXT    DEFAULT 'default',
-                created_at  TEXT    DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS search_history (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                origin      TEXT    NOT NULL,
-                destination TEXT    NOT NULL,
-                days        INTEGER DEFAULT 0,
-                passengers  INTEGER DEFAULT 1,
-                searched_at TEXT    DEFAULT (datetime('now'))
-            );
-        """)
-    print("✅ Database khởi tạo OK →", DB_PATH)
-
-# Tự động init khi import
-init_db()
+def get_sb() -> SupabaseClient:
+    global _sb
+    if _sb is None:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        if not url or not key:
+            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY")
+        _sb = create_client(url, key)
+    return _sb
 
 # ----------------------------------------------------------------
 # 🔧 HELPER
 # ----------------------------------------------------------------
-def _user_to_dict(user):
-    """Chuyển sqlite3.Row thành dict an toàn (không có password_hash)."""
+def _user_to_dict(user: dict) -> dict:
     return {
         "id":         user["id"],
         "email":      user["email"],
         "name":       user["name"],
-        "avatar":     user["avatar"] or "",
-        "created_at": user["created_at"],
+        "avatar":     user.get("avatar") or "",
+        "google_id":  user.get("google_id") or "",
+        "created_at": str(user.get("created_at") or ""),
     }
 
 def login_required_api(f):
-    """Decorator — trả 401 nếu chưa đăng nhập."""
     @wraps(f)
     def decorated(*args, **kwargs):
         if "user_id" not in session:
             return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
         return f(*args, **kwargs)
     return decorated
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 # ----------------------------------------------------------------
 # 🔑 EMAIL / PASSWORD AUTH
@@ -135,20 +126,25 @@ def register():
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
     try:
-        with get_db() as db:
-            cur = db.execute(
-                "INSERT INTO users (email, password_hash, name) VALUES (?,?,?)",
-                (email, pw_hash, name)
-            )
-            user_id = cur.lastrowid
-            user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        sb  = get_sb()
+        # Kiểm tra email đã tồn tại chưa
+        existing = sb.table("users").select("id").eq("email", email).execute()
+        if existing.data:
+            return jsonify({"success": False, "error": "Email đã được sử dụng"}), 409
 
-        session["user_id"] = user_id
+        res = sb.table("users").insert({
+            "email": email, "password_hash": pw_hash, "name": name
+        }).execute()
+        user = res.data[0]
+
+        session["user_id"] = user["id"]
         session.permanent  = True
         return jsonify({"success": True, "user": _user_to_dict(user)})
 
-    except sqlite3.IntegrityError:
-        return jsonify({"success": False, "error": "Email đã được sử dụng"}), 409
+    except Exception as e:
+        print(f"[register] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/auth/login", methods=["POST"])
 def login():
@@ -159,38 +155,49 @@ def login():
     if not email or not password:
         return jsonify({"success": False, "error": "Vui lòng nhập đầy đủ thông tin"}), 400
 
-    with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    try:
+        sb   = get_sb()
+        res  = sb.table("users").select("*").eq("email", email).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
 
-    if not user or not user["password_hash"]:
-        return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
+        user = res.data[0]
+        if not user.get("password_hash"):
+            return jsonify({"success": False, "error": "Tài khoản này dùng đăng nhập Google"}), 401
 
-    if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
-        return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
+        if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+            return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
 
-    session["user_id"] = user["id"]
-    session.permanent  = True
-    return jsonify({"success": True, "user": _user_to_dict(user)})
+        session["user_id"] = user["id"]
+        session.permanent  = True
+        return jsonify({"success": True, "user": _user_to_dict(user)})
+
+    except Exception as e:
+        print(f"[login] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/auth/logout", methods=["POST"])
 def logout():
     session.clear()
     return jsonify({"success": True})
 
+
 @auth_bp.route("/api/auth/me", methods=["GET"])
 def me():
     user_id = session.get("user_id")
     if not user_id:
         return jsonify({"success": False, "user": None})
+    try:
+        sb  = get_sb()
+        res = sb.table("users").select("*").eq("id", user_id).execute()
+        if not res.data:
+            session.clear()
+            return jsonify({"success": False, "user": None})
+        return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-
-    if not user:
-        session.clear()
-        return jsonify({"success": False, "user": None})
-
-    return jsonify({"success": True, "user": _user_to_dict(user)})
 
 # ----------------------------------------------------------------
 # 🌐 GOOGLE OAUTH
@@ -213,7 +220,7 @@ def init_oauth(app):
 @auth_bp.route("/api/auth/google")
 def google_login():
     if not _oauth_instance:
-        return jsonify({"error": "OAuth chưa được khởi tạo. Gọi init_oauth(app) trong main.py"}), 500
+        return jsonify({"error": "OAuth chưa được khởi tạo"}), 500
     redirect_uri = url_for("auth.google_callback", _external=True)
     session["next_url"] = request.args.get("next", FRONTEND_URL)
     return _oauth_instance.google.authorize_redirect(redirect_uri)
@@ -222,7 +229,6 @@ def google_login():
 def google_callback():
     if not _oauth_instance:
         return redirect(f"{FRONTEND_URL}?auth_error=oauth_not_init")
-
     try:
         token     = _oauth_instance.google.authorize_access_token()
         user_info = token.get("userinfo") or _oauth_instance.google.userinfo()
@@ -235,27 +241,22 @@ def google_callback():
         if not email:
             return redirect(f"{FRONTEND_URL}?auth_error=no_email")
 
-        with get_db() as db:
-            existing = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        sb = get_sb()
+        existing = sb.table("users").select("*").eq("email", email).execute()
 
-            if existing:
-                if not existing["google_id"]:
-                    db.execute(
-                        "UPDATE users SET google_id=?, avatar=? WHERE id=?",
-                        (google_id, avatar, existing["id"])
-                    )
-                    db.commit()
-                user_id = existing["id"]
-            else:
-                cur = db.execute(
-                    "INSERT INTO users (email, name, avatar, google_id) VALUES (?,?,?,?)",
-                    (email, name, avatar, google_id)
-                )
-                user_id = cur.lastrowid
+        if existing.data:
+            user = existing.data[0]
+            if not user.get("google_id"):
+                sb.table("users").update({"google_id": google_id, "avatar": avatar}).eq("id", user["id"]).execute()
+            user_id = user["id"]
+        else:
+            res = sb.table("users").insert({
+                "email": email, "name": name, "avatar": avatar, "google_id": google_id
+            }).execute()
+            user_id = res.data[0]["id"]
 
         session["user_id"] = user_id
         session.permanent  = True
-
         next_url = session.pop("next_url", FRONTEND_URL)
         return redirect(f"{next_url}?auth_success=1")
 
@@ -272,33 +273,27 @@ def google_callback():
 @login_required_api
 def get_schedules():
     user_id = session["user_id"]
-    with get_db() as db:
-        rows = db.execute(
-            """SELECT id, title, location, days, data_json, created_at, updated_at
-               FROM schedules WHERE user_id=? ORDER BY updated_at DESC""",
-            (user_id,)
-        ).fetchall()
-    schedules = []
-    for r in rows:
-        item = dict(r)
-        try:
-            item["data_json"] = json.loads(item["data_json"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            item["data_json"] = {}
-        schedules.append(item)
-    return jsonify({"success": True, "schedules": schedules})
+    try:
+        sb  = get_sb()
+        res = sb.table("schedules").select("id,title,location,days,data_json,created_at,updated_at").eq("user_id", user_id).order("updated_at", desc=True).execute()
+        return jsonify({"success": True, "schedules": res.data or []})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/schedules/<int:schedule_id>", methods=["GET"])
 @login_required_api
 def get_schedule(schedule_id):
     user_id = session["user_id"]
-    with get_db() as db:
-        row = db.execute("SELECT * FROM schedules WHERE id=? AND user_id=?", (schedule_id, user_id)).fetchone()
-    if not row:
-        return jsonify({"success": False, "error": "Không tìm thấy"}), 404
-    result = dict(row)
-    result["data_json"] = json.loads(result["data_json"] or "{}")
-    return jsonify({"success": True, "schedule": result})
+    try:
+        sb  = get_sb()
+        res = sb.table("schedules").select("*").eq("id", schedule_id).eq("user_id", user_id).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy"}), 404
+        return jsonify({"success": True, "schedule": res.data[0]})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/schedules/save", methods=["POST"])
 @login_required_api
@@ -310,39 +305,46 @@ def save_schedule():
     title       = (data.get("title") or "").strip() or "Lịch trình"
     location    = (data.get("location") or "").strip()
     days        = int(data.get("days") or 3)
-    data_json   = json.dumps(data.get("data_json") or {}, ensure_ascii=False)
-    now         = datetime.utcnow().isoformat()
+    data_json   = data.get("data_json") or {}
+    now         = _now_iso()
 
     if not location:
         return jsonify({"success": False, "error": "Thiếu thông tin điểm đến"}), 400
 
-    with get_db() as db:
+    try:
+        sb = get_sb()
         if schedule_id:
-            existing = db.execute("SELECT id FROM schedules WHERE id=? AND user_id=?",(schedule_id, user_id)).fetchone()
-            if not existing:
+            existing = sb.table("schedules").select("id").eq("id", schedule_id).eq("user_id", user_id).execute()
+            if not existing.data:
                 return jsonify({"success": False, "error": "Không tìm thấy lịch trình"}), 404
-
-            db.execute(
-                "UPDATE schedules SET title=?, location=?, days=?, data_json=?, updated_at=? WHERE id=? AND user_id=?",
-                (title, location, days, data_json, now, schedule_id, user_id)
-            )
+            sb.table("schedules").update({
+                "title": title, "location": location, "days": days,
+                "data_json": data_json, "updated_at": now
+            }).eq("id", schedule_id).eq("user_id", user_id).execute()
             return jsonify({"success": True, "id": schedule_id, "action": "updated"})
         else:
-            cur = db.execute(
-                "INSERT INTO schedules (user_id, title, location, days, data_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                (user_id, title, location, days, data_json, now, now)
-            )
-            return jsonify({"success": True, "id": cur.lastrowid, "action": "created"})
+            res = sb.table("schedules").insert({
+                "user_id": user_id, "title": title, "location": location,
+                "days": days, "data_json": data_json,
+                "created_at": now, "updated_at": now
+            }).execute()
+            return jsonify({"success": True, "id": res.data[0]["id"], "action": "created"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/schedules/<int:schedule_id>", methods=["DELETE"])
 @login_required_api
 def delete_schedule(schedule_id):
     user_id = session["user_id"]
-    with get_db() as db:
-        result = db.execute("DELETE FROM schedules WHERE id=? AND user_id=?", (schedule_id, user_id))
-    if result.rowcount == 0:
-        return jsonify({"success": False, "error": "Không tìm thấy"}), 404
-    return jsonify({"success": True})
+    try:
+        sb  = get_sb()
+        res = sb.table("schedules").delete().eq("id", schedule_id).eq("user_id", user_id).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ================================================================
@@ -358,68 +360,69 @@ def update_avatar():
     file = request.files['avatar']
     if file.filename == '':
         return jsonify({"success": False, "error": "Chưa chọn file"}), 400
-
-    # [FIX 2] Validate định dạng file ảnh
     if not allowed_file(file.filename):
         return jsonify({"success": False, "error": "Chỉ chấp nhận file ảnh (png, jpg, jpeg, gif, webp)"}), 400
 
-    user_id = session["user_id"]
+    user_id  = session["user_id"]
     filename = secure_filename(f"user_{user_id}_{file.filename}")
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
 
-    # [FIX 3] Dùng full URL để frontend React có thể load ảnh đúng
     avatar_url = f"{request.host_url}static/avatars/{filename}"
 
-    with get_db() as db:
-        db.execute("UPDATE users SET avatar=? WHERE id=?", (avatar_url, user_id))
-        db.commit()  # [FIX 1] Commit để lưu thay đổi vào DB
-        user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    try:
+        sb  = get_sb()
+        sb.table("users").update({"avatar": avatar_url}).eq("id", user_id).execute()
+        res = sb.table("users").select("*").eq("id", user_id).execute()
+        return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    return jsonify({"success": True, "user": _user_to_dict(user)})
 
 @auth_bp.route("/api/auth/update-profile", methods=["POST"])
 @login_required_api
 def update_profile():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
-
     if not name:
         return jsonify({"success": False, "error": "Tên không được để trống"}), 400
 
     user_id = session["user_id"]
-    with get_db() as db:
-        db.execute("UPDATE users SET name=? WHERE id=?", (name, user_id))
-        db.commit()  # [FIX 1] Commit để lưu thay đổi vào DB
-        user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    try:
+        sb  = get_sb()
+        sb.table("users").update({"name": name}).eq("id", user_id).execute()
+        res = sb.table("users").select("*").eq("id", user_id).execute()
+        return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    return jsonify({"success": True, "user": _user_to_dict(user)})
 
 @auth_bp.route("/api/auth/change-password", methods=["POST"])
 @login_required_api
 def change_password():
-    data = request.get_json() or {}
+    data       = request.get_json() or {}
     current_pw = data.get("current_password") or ""
-    new_pw = data.get("new_password") or ""
-    user_id = session["user_id"]
+    new_pw     = data.get("new_password") or ""
+    user_id    = session["user_id"]
 
     if len(new_pw) < 6:
         return jsonify({"success": False, "error": "Mật khẩu mới phải ít nhất 6 ký tự"}), 400
 
-    with get_db() as db:
-        user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    try:
+        sb   = get_sb()
+        res  = sb.table("users").select("password_hash").eq("id", user_id).execute()
+        user = res.data[0]
 
-        if not user["password_hash"]:
+        if not user.get("password_hash"):
             return jsonify({"success": False, "error": "Tài khoản Google không thể đổi mật khẩu"}), 400
-
         if not bcrypt.checkpw(current_pw.encode(), user["password_hash"].encode()):
             return jsonify({"success": False, "error": "Mật khẩu hiện tại không đúng"}), 400
 
-        new_pw_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
-        db.execute("UPDATE users SET password_hash=? WHERE id=?", (new_pw_hash, user_id))
-        db.commit()  # [FIX 1] Commit để lưu thay đổi vào DB
-
-    return jsonify({"success": True})
+        new_hash = bcrypt.hashpw(new_pw.encode(), bcrypt.gensalt()).decode()
+        sb.table("users").update({"password_hash": new_hash}).eq("id", user_id).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ================================================================
@@ -430,15 +433,19 @@ def change_password():
 @login_required_api
 def get_favorites():
     user_id = session["user_id"]
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM favorites WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
-    return jsonify({"success": True, "favorites": [dict(r) for r in rows]})
+    try:
+        sb  = get_sb()
+        res = sb.table("favorites").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+        return jsonify({"success": True, "favorites": res.data or []})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/favorites", methods=["POST"])
 @login_required_api
 def add_favorite():
-    user_id = session["user_id"]
-    data = request.get_json() or {}
+    user_id   = session["user_id"]
+    data      = request.get_json() or {}
     name      = (data.get("name") or "").strip()
     location  = (data.get("location") or "").strip()
     rating    = str(data.get("rating") or "")
@@ -448,43 +455,44 @@ def add_favorite():
     if not name:
         return jsonify({"success": False, "error": "Thiếu tên địa điểm"}), 400
 
-    with get_db() as db:
-        # Kiểm tra trùng lặp
-        existing = db.execute(
-            "SELECT id FROM favorites WHERE user_id=? AND name=? AND location=?",
-            (user_id, name, location)
-        ).fetchone()
-        if existing:
-            return jsonify({"success": True, "id": existing["id"], "duplicate": True})
+    try:
+        sb = get_sb()
+        existing = sb.table("favorites").select("id").eq("user_id", user_id).eq("name", name).eq("location", location).execute()
+        if existing.data:
+            return jsonify({"success": True, "id": existing.data[0]["id"], "duplicate": True})
 
-        cur = db.execute(
-            "INSERT INTO favorites (user_id, name, location, rating, thumbnail, type) VALUES (?,?,?,?,?,?)",
-            (user_id, name, location, rating, thumbnail, fav_type)
-        )
-        return jsonify({"success": True, "id": cur.lastrowid})
+        res = sb.table("favorites").insert({
+            "user_id": user_id, "name": name, "location": location,
+            "rating": rating, "thumbnail": thumbnail, "type": fav_type
+        }).execute()
+        return jsonify({"success": True, "id": res.data[0]["id"]})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/favorites/<int:fav_id>", methods=["DELETE"])
 @login_required_api
 def delete_favorite(fav_id):
     user_id = session["user_id"]
-    with get_db() as db:
-        db.execute("DELETE FROM favorites WHERE id=? AND user_id=?", (fav_id, user_id))
-    return jsonify({"success": True})
+    try:
+        get_sb().table("favorites").delete().eq("id", fav_id).eq("user_id", user_id).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @auth_bp.route("/api/favorites/remove-by-name", methods=["POST"])
 @login_required_api
 def remove_favorite_by_name():
-    user_id = session["user_id"]
-    data = request.get_json() or {}
+    user_id  = session["user_id"]
+    data     = request.get_json() or {}
     name     = (data.get("name") or "").strip()
     location = (data.get("location") or "").strip()
-    with get_db() as db:
-        db.execute(
-            "DELETE FROM favorites WHERE user_id=? AND name=? AND location=?",
-            (user_id, name, location)
-        )
-    return jsonify({"success": True})
+    try:
+        get_sb().table("favorites").delete().eq("user_id", user_id).eq("name", name).eq("location", location).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ================================================================
@@ -495,42 +503,58 @@ def remove_favorite_by_name():
 @login_required_api
 def get_search_history():
     user_id = session["user_id"]
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM search_history WHERE user_id=? ORDER BY searched_at DESC LIMIT 50", (user_id,)).fetchall()
-    return jsonify({"success": True, "history": [dict(r) for r in rows]})
+    try:
+        sb  = get_sb()
+        res = sb.table("search_history").select("*").eq("user_id", str(user_id)).order("searched_at", desc=True).limit(20).execute()
+        return jsonify({"success": True, "history": res.data or []})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/search-history", methods=["POST"])
 @login_required_api
 def add_search_history():
-    user_id = session["user_id"]
-    data        = request.get_json() or {}
-    origin      = (data.get("origin") or "").strip()
-    destination = (data.get("destination") or "").strip()
-    days        = int(data.get("days") or 0)
-    passengers  = int(data.get("passengers") or 1)
+    user_id  = session["user_id"]
+    data     = request.get_json() or {}
+    location = (data.get("location") or "").strip()
 
-    if not destination:
+    if not location:
         return jsonify({"success": False, "error": "Thiếu điểm đến"}), 400
 
-    with get_db() as db:
-        cur = db.execute(
-            "INSERT INTO search_history (user_id, origin, destination, days, passengers) VALUES (?,?,?,?,?)",
-            (user_id, origin, destination, days, passengers)
-        )
-    return jsonify({"success": True, "id": cur.lastrowid})
+    try:
+        sb  = get_sb()
+        res = sb.table("search_history").insert({
+            "user_id":        str(user_id),
+            "location":       location,
+            "origin":         data.get("origin", ""),
+            "budget":         int(data.get("budget", 0)),
+            "days":           int(data.get("days", 3)),
+            "passengers":     int(data.get("passengers", 1)),
+            "departure_date": data.get("departure_date", ""),
+            "searched_at":    int(time.time()),
+        }).execute()
+        return jsonify({"success": True, "id": res.data[0]["id"]})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @auth_bp.route("/api/search-history/<int:history_id>", methods=["DELETE"])
 @login_required_api
 def delete_search_history(history_id):
     user_id = session["user_id"]
-    with get_db() as db:
-        db.execute("DELETE FROM search_history WHERE id=? AND user_id=?", (history_id, user_id))
-    return jsonify({"success": True})
+    try:
+        get_sb().table("search_history").delete().eq("id", history_id).eq("user_id", str(user_id)).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-@auth_bp.route("/api/search-history/all", methods=["DELETE"])
+
+@auth_bp.route("/api/search-history/clear", methods=["DELETE"])
 @login_required_api
 def clear_search_history():
     user_id = session["user_id"]
-    with get_db() as db:
-        db.execute("DELETE FROM search_history WHERE user_id=?", (user_id,))
-    return jsonify({"success": True})
+    try:
+        get_sb().table("search_history").delete().eq("user_id", str(user_id)).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500

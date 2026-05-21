@@ -887,12 +887,9 @@ def get_weather():
     return jsonify(result), status
 
 # ================================================================
-# 🔗 SHARE LINK  —  /trip/<trip_id>
+# 🔗 SHARE LINK  —  /trip/<trip_id>  (Supabase)
 # ================================================================
 import json, hashlib, time
-
-# In-memory store (thay bằng Redis / DB khi production)
-_trip_store = {}   # { trip_id: { plan, meta, created_at } }
 
 def _gen_id(payload: str) -> str:
     """8 ký tự hex ngắn gọn, đủ unique cho demo."""
@@ -920,29 +917,196 @@ def trip_save():
         if not body:
             return jsonify({"success": False, "error": "Body rỗng"}), 400
 
+        uid     = _sp_get_uid()
+        meta    = body.get("meta", {})
         trip_id = _gen_id(json.dumps(body, ensure_ascii=False, sort_keys=True))
 
-        _trip_store[trip_id] = {
-            "plan":       body.get("plan", {}),
-            "dailyPlans": body.get("dailyPlans", []),
-            "meta":       body.get("meta", {}),
-            "created_at": int(time.time()),
-        }
+        sb = _get_supabase()
+        sb.table("trips").upsert({
+            "id":          trip_id,
+            "user_id":     str(uid) if uid else "anonymous",
+            "location":    meta.get("location",  ""),
+            "origin":      meta.get("origin",    ""),
+            "days":        int(meta.get("days",  3)),
+            "start_date":  meta.get("startDate", ""),
+            "plan":        body.get("plan",       {}),
+            "daily_plans": body.get("dailyPlans", []),
+            "created_at":  int(time.time()),
+        }).execute()
 
         share_url = f"{request.host_url.rstrip('/')}/trip/{trip_id}"
         return jsonify({"success": True, "trip_id": trip_id, "share_url": share_url})
 
     except Exception as e:
+        print(f"[trip_save] Lỗi: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/trip/<trip_id>", methods=["GET"])
 def trip_get(trip_id):
     """Trả về JSON data của trip (dùng cho frontend load lại lịch trình)."""
-    trip = _trip_store.get(trip_id)
-    if not trip:
-        return jsonify({"success": False, "error": "Không tìm thấy lịch trình"}), 404
-    return jsonify({"success": True, **trip})
+    try:
+        sb  = _get_supabase()
+        res = sb.table("trips").select("*").eq("id", trip_id).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy lịch trình"}), 404
+        row = res.data[0]
+        return jsonify({
+            "success":    True,
+            "plan":       row.get("plan",        {}),
+            "dailyPlans": row.get("daily_plans",  []),
+            "meta": {
+                "location":  row.get("location",   ""),
+                "origin":    row.get("origin",     ""),
+                "days":      row.get("days",        3),
+                "startDate": row.get("start_date", ""),
+            },
+            "created_at": row.get("created_at", 0),
+        })
+    except Exception as e:
+        print(f"[trip_get] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/my-trips", methods=["GET"])
+def my_trips():
+    """Danh sách lịch trình đã lưu của user đang đăng nhập."""
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    try:
+        sb  = _get_supabase()
+        res = (
+            sb.table("trips")
+            .select("id, location, origin, days, start_date, created_at")
+            .eq("user_id", str(uid))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return jsonify({"success": True, "trips": res.data or []})
+    except Exception as e:
+        print(f"[my_trips] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/my-trips/<trip_id>", methods=["DELETE"])
+def my_trips_delete(trip_id):
+    """Xóa 1 lịch trình của user."""
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    try:
+        sb  = _get_supabase()
+        res = (
+            sb.table("trips")
+            .delete()
+            .eq("id", trip_id)
+            .eq("user_id", str(uid))
+            .execute()
+        )
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy hoặc không có quyền"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"[my_trips_delete] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ================================================================
+# 🔍 LỊCH SỬ TÌM KIẾM — /api/search-history (Supabase)
+# ================================================================
+
+@app.route("/api/search-history", methods=["GET"])
+def search_history_list():
+    """Lấy lịch sử tìm kiếm của user, mới nhất lên trước, tối đa 20 mục."""
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    try:
+        sb  = _get_supabase()
+        res = (
+            sb.table("search_history")
+            .select("id, location, origin, budget, days, passengers, departure_date, searched_at")
+            .eq("user_id", str(uid))
+            .order("searched_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        return jsonify({"success": True, "history": res.data or []})
+    except Exception as e:
+        print(f"[search_history_list] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/search-history", methods=["POST"])
+def search_history_add():
+    """
+    Tự động gọi khi user bấm tìm kiếm.
+    Body JSON: { location, origin, budget, days, passengers, departure_date }
+    """
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+
+    data = request.get_json(force=True) or {}
+    location = (data.get("location", "") or "").strip()
+    if not location:
+        return jsonify({"success": False, "error": "Thiếu location"}), 400
+
+    try:
+        sb = _get_supabase()
+        sb.table("search_history").insert({
+            "user_id":        str(uid),
+            "location":       location,
+            "origin":         data.get("origin",         ""),
+            "budget":         int(data.get("budget",      0)),
+            "days":           int(data.get("days",        3)),
+            "passengers":     int(data.get("passengers",  1)),
+            "departure_date": data.get("departure_date", ""),
+            "searched_at":    int(time.time()),
+        }).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"[search_history_add] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/search-history/<int:history_id>", methods=["DELETE"])
+def search_history_delete(history_id):
+    """Xóa 1 mục lịch sử tìm kiếm."""
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    try:
+        sb  = _get_supabase()
+        res = (
+            sb.table("search_history")
+            .delete()
+            .eq("id", history_id)
+            .eq("user_id", str(uid))
+            .execute()
+        )
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"[search_history_delete] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/search-history/clear", methods=["DELETE"])
+def search_history_clear():
+    """Xóa toàn bộ lịch sử tìm kiếm của user."""
+    uid = _sp_get_uid()
+    if not uid:
+        return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
+    try:
+        sb = _get_supabase()
+        sb.table("search_history").delete().eq("user_id", str(uid)).execute()
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"[search_history_clear] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ================================================================
@@ -1221,43 +1385,45 @@ def static_map():
 
 
 # ================================================================
-# 🔖 LƯU TRỮ ĐỊA ĐIỂM — /api/saved-places (ĐÃ CONFIG LƯU FILE JSON VĨNH VIỄN)
+# 🔖 LƯU TRỮ ĐỊA ĐIỂM — /api/saved-places (Supabase)
 # ================================================================
-import json
+# Cài đặt: pip install supabase
+# Thêm vào .env:
+#   SUPABASE_URL=https://xxxx.supabase.co
+#   SUPABASE_SERVICE_KEY=eyJh...   <-- dùng service_role key (không phải anon key)
+#
+# Tạo bảng trên Supabase (SQL Editor):
+#   CREATE TABLE saved_places (
+#       id         BIGSERIAL PRIMARY KEY,
+#       user_id    TEXT      NOT NULL,
+#       name       TEXT      NOT NULL,
+#       location   TEXT      DEFAULT '',
+#       rating     TEXT      DEFAULT '',
+#       thumbnail  TEXT      DEFAULT '',
+#       type       TEXT      DEFAULT 'default',
+#       saved_at   BIGINT    DEFAULT EXTRACT(EPOCH FROM NOW())
+#   );
+#   CREATE INDEX idx_saved_places_user_id ON saved_places(user_id);
+# ================================================================
 
-SAVED_PLACES_FILE = "saved_places_db.json"
+from supabase import create_client, Client as SupabaseClient
 
-def _load_saved_places():
-    """Đọc dữ liệu từ file JSON cục bộ lên RAM khi khởi động server"""
-    if os.path.exists(SAVED_PLACES_FILE):
-        try:
-            with open(SAVED_PLACES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+_supabase_client: SupabaseClient | None = None
 
-def _save_saved_places(data):
-    """Ghi dữ liệu từ RAM xuống file JSON vĩnh viễn trên ổ cứng"""
-    try:
-        with open(SAVED_PLACES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"Lỗi ghi file lưu trữ: {e}")
-
-# Khởi tạo bộ nhớ từ file JSON thay vì Object rỗng
-_saved_places_store = _load_saved_places()
+def _get_supabase() -> SupabaseClient:
+    """Khởi tạo Supabase client 1 lần duy nhất (singleton)."""
+    global _supabase_client
+    if _supabase_client is None:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        if not url or not key:
+            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY trong .env")
+        _supabase_client = create_client(url, key)
+    return _supabase_client
 
 def _sp_get_uid():
     from flask import session
     return session.get("user_id")
-
-def _sp_next_id(uid: str) -> int:
-    """Tự động tìm ID lớn nhất của user rồi + 1, không dùng counter RAM cũ"""
-    places = _saved_places_store.get(uid, [])
-    if not places:
-        return 1
-    return max(p.get("id", 0) for p in places) + 1
 
 
 @app.route("/api/saved-places", methods=["GET"])
@@ -1265,8 +1431,20 @@ def saved_places_list():
     uid = _sp_get_uid()
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
-    places = _saved_places_store.get(str(uid), [])
-    return jsonify({"success": True, "savedPlaces": places, "places": places})
+    try:
+        sb = _get_supabase()
+        res = (
+            sb.table("saved_places")
+            .select("id, name, location, rating, thumbnail, type, saved_at")
+            .eq("user_id", str(uid))
+            .order("saved_at", desc=True)
+            .execute()
+        )
+        places = res.data or []
+        return jsonify({"success": True, "savedPlaces": places, "places": places})
+    except Exception as e:
+        print(f"[saved_places_list] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/saved-places", methods=["POST"])
@@ -1282,43 +1460,64 @@ def saved_places_add():
     if not name:
         return jsonify({"success": False, "error": "Thiếu tên địa điểm"}), 400
 
-    key = str(uid)
-    if key not in _saved_places_store:
-        _saved_places_store[key] = []
+    try:
+        sb = _get_supabase()
 
-    for p in _saved_places_store[key]:
-        if p.get("name") == name and p.get("location") == location:
-            return jsonify({"success": True, "message": "Đã lưu trước đó", "id": p.get("id")})
+        # Kiểm tra đã lưu chưa
+        check = (
+            sb.table("saved_places")
+            .select("id")
+            .eq("user_id", str(uid))
+            .eq("name", name)
+            .eq("location", location)
+            .execute()
+        )
+        if check.data:
+            return jsonify({"success": True, "message": "Đã lưu trước đó", "id": check.data[0]["id"]})
 
-    new_id = _sp_next_id(key)
-    _saved_places_store[key].append({
-        "id":        new_id,
-        "name":      name,
-        "location":  location,
-        "rating":    data.get("rating",    ""),
-        "thumbnail": data.get("thumbnail", ""),
-        "type":      data.get("type",      "default"),
-        "saved_at":  int(time.time()),
-    })
-    
-    _save_saved_places(_saved_places_store) # 💾 Đồng bộ lưu xuống file
-    return jsonify({"success": True, "id": new_id})
+        # Thêm mới
+        insert_res = (
+            sb.table("saved_places")
+            .insert({
+                "user_id":   str(uid),
+                "name":      name,
+                "location":  location,
+                "rating":    str(data.get("rating",    "") or ""),
+                "thumbnail": data.get("thumbnail", "") or "",
+                "type":      data.get("type",      "default") or "default",
+                "saved_at":  int(time.time()),
+            })
+            .execute()
+        )
+        new_id = insert_res.data[0]["id"] if insert_res.data else None
+        return jsonify({"success": True, "id": new_id})
+    except Exception as e:
+        print(f"[saved_places_add] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/saved-places/check", methods=["GET"])
 def saved_places_check():
     uid = _sp_get_uid()
     if not uid:
-        return jsonify({"exists": False})
+        return jsonify({"success": False, "isSaved": False})
 
     name     = request.args.get("name",     "").strip()
     location = request.args.get("location", "").strip()
-    places   = _saved_places_store.get(str(uid), [])
-    exists   = any(
-        p.get("name") == name and p.get("location") == location
-        for p in places
-    )
-    return jsonify({"exists": exists})
+    try:
+        sb = _get_supabase()
+        res = (
+            sb.table("saved_places")
+            .select("id")
+            .eq("user_id", str(uid))
+            .eq("name", name)
+            .eq("location", location)
+            .execute()
+        )
+        return jsonify({"success": True, "isSaved": bool(res.data), "exists": bool(res.data)})
+    except Exception as e:
+        print(f"[saved_places_check] Lỗi: {e}")
+        return jsonify({"success": False, "isSaved": False})
 
 
 @app.route("/api/saved-places/remove-by-name", methods=["POST"])
@@ -1331,17 +1530,21 @@ def saved_places_remove_by_name():
     name     = (data.get("name",     "") or "").strip()
     location = (data.get("location", "") or "").strip()
 
-    key    = str(uid)
-    before = _saved_places_store.get(key, [])
-    after  = [
-        p for p in before
-        if not (p.get("name") == name and p.get("location") == location)
-    ]
-    _saved_places_store[key] = after
-    removed = len(before) - len(after)
-    
-    _save_saved_places(_saved_places_store) # 💾 Cập nhật file sau khi bỏ bookmark
-    return jsonify({"success": True, "removed": removed})
+    try:
+        sb = _get_supabase()
+        res = (
+            sb.table("saved_places")
+            .delete()
+            .eq("user_id", str(uid))
+            .eq("name", name)
+            .eq("location", location)
+            .execute()
+        )
+        removed = len(res.data) if res.data else 0
+        return jsonify({"success": True, "removed": removed})
+    except Exception as e:
+        print(f"[saved_places_remove_by_name] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/saved-places/<int:place_id>", methods=["DELETE"])
@@ -1350,16 +1553,21 @@ def saved_places_delete(place_id):
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
 
-    key    = str(uid)
-    before = _saved_places_store.get(key, [])
-    after  = [p for p in before if p.get("id") != place_id]
-
-    if len(before) == len(after):
-        return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
-
-    _saved_places_store[key] = after
-    _save_saved_places(_saved_places_store) # 💾 Cập nhật file sau khi click nút xóa card
-    return jsonify({"success": True})
+    try:
+        sb = _get_supabase()
+        res = (
+            sb.table("saved_places")
+            .delete()
+            .eq("user_id", str(uid))
+            .eq("id", place_id)
+            .execute()
+        )
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"[saved_places_delete] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/saved-places/<int:place_id>", methods=["PUT"])
@@ -1368,19 +1576,24 @@ def saved_places_update(place_id):
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
 
-    data = request.get_json(force=True) or {}
+    data          = request.get_json(force=True) or {}
     new_thumbnail = data.get("thumbnail", "")
 
-    key = str(uid)
-    places = _saved_places_store.get(key, [])
-    
-    for p in places:
-        if p.get("id") == place_id:
-            p["thumbnail"] = to_proxy_url(new_thumbnail)
-            _save_saved_places(_saved_places_store) # 💾 Lưu đè ảnh nét vĩnh viễn xuống ổ cứng
-            return jsonify({"success": True, "message": "Đã lưu vĩnh viễn ảnh nét vào bộ nhớ"})
-
-    return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
+    try:
+        sb = _get_supabase()
+        res = (
+            sb.table("saved_places")
+            .update({"thumbnail": to_proxy_url(new_thumbnail)})
+            .eq("user_id", str(uid))
+            .eq("id", place_id)
+            .execute()
+        )
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy địa điểm"}), 404
+        return jsonify({"success": True, "message": "Đã cập nhật ảnh thành công"})
+    except Exception as e:
+        print(f"[saved_places_update] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
