@@ -1390,7 +1390,7 @@ def static_map():
 # Cài đặt: pip install supabase
 # Thêm vào .env:
 #   SUPABASE_URL=https://xxxx.supabase.co
-#   SUPABASE_SERVICE_KEY=eyJh...   <-- dùng service_role key (không phải anon key)
+#   SUPABASE_ANON_KEY=eyJh...   <-- dùng anon key
 #
 # Tạo bảng trên Supabase (SQL Editor):
 #   CREATE TABLE saved_places (
@@ -1415,9 +1415,9 @@ def _get_supabase() -> SupabaseClient:
     global _supabase_client
     if _supabase_client is None:
         url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        key = os.getenv("SUPABASE_ANON_KEY", "")
         if not url or not key:
-            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY trong .env")
+            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_ANON_KEY trong .env")
         _supabase_client = create_client(url, key)
     return _supabase_client
 
