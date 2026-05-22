@@ -7,7 +7,8 @@ Dự án môn học: CTT009 - COMPUTATIONAL THINKING
 # OPENWEATHER_KEY=3ec67bda30dc2e7f8d4124a75ab6c2fd
 # GEMINI_API_KEY=API_Key_vao_day
 # SUPABASE_URL=https://glghrxqpowifcofofsfg.supabase.co
-# SUPABASE_SERVICE_KEY=sb_publishable_amw0fthx0QtAEatE9TVzsg_qLUCb0Sx
+# SUPABASE_SERVICE_KEY=sb_secret_2phpj6C0MTJ_Oo15ybMVOg_h9nuK8N7
+# FRONT_END=link_front_end vào đây (bỏ / ở cuối) (Nếu dùng Codespaces)
 
 # CHẠY TERMINAL 2 DÒNG LỆNH DƯỚI
 

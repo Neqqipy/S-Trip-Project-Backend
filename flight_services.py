@@ -673,6 +673,7 @@ def get_smart_flight_recommendations(
                     "stops":         "Bay thẳng" if len(f.get("flights", [])) - 1 == 0 else f"{len(f.get('flights', [])) - 1} điểm dừng",
                     "departure":     leg.get("departure_airport", {}).get("time", ""),
                     "arrival":       leg.get("arrival_airport", {}).get("time", ""),
+                    "booking_token": f.get("booking_token", ""),  # ← THÊM
                 })
 
             parsed.sort(key=lambda x: (x["price"], x.get("duration_mins", 9999)))
@@ -794,6 +795,7 @@ def _fetch_flights_for_date_iata(
                 "stops":         "Bay thẳng" if len(f.get("flights", [])) - 1 == 0 else f"{len(f.get('flights', [])) - 1} điểm dừng",
                 "departure":     leg.get("departure_airport", {}).get("time", ""),
                 "arrival":       leg.get("arrival_airport", {}).get("time", ""),
+                "booking_token": f.get("booking_token", ""),
             })
         parsed.sort(key=lambda x: (x["price"], x.get("duration_mins", 9999)))
         seen, final = {}, []

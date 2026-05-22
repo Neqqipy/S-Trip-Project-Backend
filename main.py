@@ -1415,7 +1415,7 @@ def _get_supabase() -> SupabaseClient:
     global _supabase_client
     if _supabase_client is None:
         url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_ANON_KEY", "")
+        key = os.getenv("SUPABASE_SERVICE_KEY", "")
         if not url or not key:
             raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_ANON_KEY trong .env")
         _supabase_client = create_client(url, key)
