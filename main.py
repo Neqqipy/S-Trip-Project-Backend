@@ -25,7 +25,7 @@ app.permanent_session_lifetime = timedelta(days=30)
 # FIX SESSION COOKIE: SameSite=None bi chon tren HTTP localhost
 # Dung 'Lax' cho dev HTTP, chi dung 'None' khi deploy HTTPS
 app.config.update(
-    SESSION_COOKIE_SAMESITE='None',   # None = gui cookie cross-site
+    SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=False,      # Chrome 148+ cho phep None+HTTP tren localhost
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_NAME='strip_session',
