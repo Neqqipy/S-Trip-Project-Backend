@@ -1390,7 +1390,7 @@ def static_map():
 # Cài đặt: pip install supabase
 # Thêm vào .env:
 #   SUPABASE_URL=https://xxxx.supabase.co
-#   SUPABASE_ANON_KEY=eyJh...   <-- dùng anon key
+#   SUPABASE_SERVICE_ROLE_KEY=eyJh...   <-- dùng service_role key (lấy tại Supabase → Settings → API → service_role)
 #
 # Tạo bảng trên Supabase (SQL Editor):
 #   CREATE TABLE saved_places (

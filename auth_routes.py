@@ -98,6 +98,7 @@ def get_sb(user_id=None) -> SupabaseClient:
 def _user_to_dict(user: dict) -> dict:
     return {
         "id":         user["id"],
+        "username":   user.get("username") or "",
         "email":      user["email"],
         "name":       user["name"],
         "avatar":     user.get("avatar") or "",
@@ -124,34 +125,56 @@ def _now_iso() -> str:
 @auth_bp.route("/api/auth/register", methods=["POST"])
 def register():
     data     = request.get_json() or {}
+    username = (data.get("username") or "").strip().lower()
     email    = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     name     = (data.get("name") or "").strip()
 
+    if not username:
+        return jsonify({"success": False, "error": "Vui lòng nhập tên đăng nhập"}), 400
     if not email or "@" not in email:
         return jsonify({"success": False, "error": "Email không hợp lệ"}), 400
     if len(password) < 6:
         return jsonify({"success": False, "error": "Mật khẩu phải ít nhất 6 ký tự"}), 400
     if not name:
-        return jsonify({"success": False, "error": "Vui lòng nhập tên"}), 400
+        return jsonify({"success": False, "error": "Vui lòng nhập tên hiển thị"}), 400
 
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
     try:
         sb  = get_sb()
+        # Kiểm tra username đã tồn tại chưa
+        existing_user = sb.table("users").select("id").eq("username", username).execute()
+        if existing_user.data:
+            return jsonify({"success": False, "error": "Tên đăng nhập đã được sử dụng"}), 409
         # Kiểm tra email đã tồn tại chưa
-        existing = sb.table("users").select("id").eq("email", email).execute()
-        if existing.data:
+        existing_email = sb.table("users").select("id").eq("email", email).execute()
+        if existing_email.data:
             return jsonify({"success": False, "error": "Email đã được sử dụng"}), 409
 
+        # Tạo token xác nhận email
+        verify_token      = secrets.token_urlsafe(32)
+        verify_expires_at = int(time.time()) + 24 * 3600  # 24 giờ
+
         res = sb.table("users").insert({
-            "email": email, "password_hash": pw_hash, "name": name
+            "username": username, "email": email, "password_hash": pw_hash, "name": name,
+            "email_verified": False,
+            "verify_token": verify_token,
+            "verify_token_expires": verify_expires_at,
         }).execute()
         user = res.data[0]
 
-        session["user_id"] = user["id"]
-        session.permanent  = True
-        return jsonify({"success": True, "user": _user_to_dict(user)})
+        # Gửi email xác nhận (chạy trong try riêng để không block đăng ký nếu mail lỗi)
+        email_sent = True
+        try:
+            frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+            _send_verification_email(email, verify_token, frontend_url)
+        except Exception as mail_err:
+            email_sent = False
+            print(f"[register] Gửi email xác nhận thất bại: {mail_err}")
+
+        # KHÔNG tạo session — yêu cầu xác nhận email trước
+        return jsonify({"success": True, "pending_verification": True, "email": email, "email_sent": email_sent})
 
     except Exception as e:
         print(f"[register] Lỗi: {e}")
@@ -161,24 +184,28 @@ def register():
 @auth_bp.route("/api/auth/login", methods=["POST"])
 def login():
     data     = request.get_json() or {}
-    email    = (data.get("email") or "").strip().lower()
+    username = (data.get("username") or "").strip().lower()
     password = data.get("password") or ""
 
-    if not email or not password:
+    if not username or not password:
         return jsonify({"success": False, "error": "Vui lòng nhập đầy đủ thông tin"}), 400
 
     try:
         sb   = get_sb()
-        res  = sb.table("users").select("*").eq("email", email).execute()
+        res  = sb.table("users").select("*").eq("username", username).execute()
         if not res.data:
-            return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
+            return jsonify({"success": False, "error": "Tên đăng nhập hoặc mật khẩu không đúng"}), 401
 
         user = res.data[0]
         if not user.get("password_hash"):
-            return jsonify({"success": False, "error": "Tài khoản này dùng đăng nhập Google"}), 401
+            return jsonify({"success": False, "error": "Tài khoản này chưa đặt mật khẩu"}), 401
 
         if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
-            return jsonify({"success": False, "error": "Email hoặc mật khẩu không đúng"}), 401
+            return jsonify({"success": False, "error": "Tên đăng nhập hoặc mật khẩu không đúng"}), 401
+
+        # Chặn đăng nhập nếu email chưa được xác nhận
+        if not user.get("email_verified", True):  # True là fallback cho tài khoản cũ chưa có field
+            return jsonify({"success": False, "error": "Chưa xác nhận email", "pending_verification": True, "email": user.get("email", "")}), 403
 
         session["user_id"] = user["id"]
         session.permanent  = True
@@ -193,6 +220,27 @@ def login():
 def logout():
     session.clear()
     return jsonify({"success": True})
+
+
+@auth_bp.route("/api/auth/delete-account", methods=["DELETE"])
+@login_required_api
+def delete_account():
+    """
+    Xóa vĩnh viễn tài khoản và toàn bộ dữ liệu liên quan.
+    Vì bảng users có ON DELETE CASCADE nên schedules, favorites,
+    saved_places, search_history... sẽ bị xóa theo tự động.
+    """
+    user_id = session["user_id"]
+    try:
+        sb  = get_sb()
+        res = sb.table("users").delete().eq("id", user_id).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Không tìm thấy tài khoản"}), 404
+        session.clear()
+        return jsonify({"success": True, "message": "Tài khoản đã được xóa vĩnh viễn"})
+    except Exception as e:
+        print(f"[delete_account] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @auth_bp.route("/api/auth/me", methods=["GET"])
@@ -234,7 +282,6 @@ def google_login():
     if not _oauth_instance:
         return jsonify({"error": "OAuth chưa được khởi tạo"}), 500
     redirect_uri = url_for("auth.google_callback", _external=True)
-    session["next_url"] = request.args.get("next", FRONTEND_URL)
     return _oauth_instance.google.authorize_redirect(redirect_uri)
 
 @auth_bp.route("/api/auth/google/callback")
@@ -269,8 +316,8 @@ def google_callback():
 
         session["user_id"] = user_id
         session.permanent  = True
-        next_url = session.pop("next_url", FRONTEND_URL)
-        return redirect(f"{next_url}?auth_success=1")
+        # Luôn redirect về root để ?auth_success=1 không bị hash nuốt
+        return redirect(f"{FRONTEND_URL}/?auth_success=1")
 
     except Exception as e:
         print(f"[Google OAuth Error] {e}")
@@ -622,6 +669,43 @@ def _send_reset_email(to_email: str, token: str, frontend_url: str):
         server.sendmail(mail_user, to_email, msg.as_string())
 
 
+def _send_verification_email(to_email: str, token: str, frontend_url: str):
+    """Gửi email xác nhận tài khoản sau khi đăng ký."""
+    mail_user = os.getenv("MAIL_EMAIL", "")
+    mail_pass = os.getenv("MAIL_PASSWORD", "")
+    if not mail_user or not mail_pass:
+        raise RuntimeError("Thiếu MAIL_EMAIL hoặc MAIL_PASSWORD trong .env")
+
+    verify_link = f"{frontend_url}/#/verify-email?token={token}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "[S-Trip] Xác nhận địa chỉ email của bạn"
+    msg["From"]    = f"S-Trip <{mail_user}>"
+    msg["To"]      = to_email
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:40px 30px;background:#f9fafb;border-radius:16px;">
+      <div style="text-align:center;">
+        <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:20px;">
+          <img src="https://glghrxqpowifcofofsfg.supabase.co/storage/v1/object/public/assets/S.jpg" style="width:44px;height:44px;border-radius:50%;object-fit:cover;vertical-align:middle;" alt="S-Trip"/>
+          <h2 style="color:#10b981;margin:0;font-size:24px;line-height:44px;">S-Trip</h2>
+        </div>
+        <h3 style="color:#111827;margin:0 0 12px;">Xác nhận email của bạn</h3>
+        <p style="color:#374151;margin:0 0 20px;">Bấm nút bên dưới để xác nhận địa chỉ email và kích hoạt tài khoản (hiệu lực <strong>24 giờ</strong>):</p>
+        <a href="{verify_link}" style="background:#10b981;color:white;padding:14px 36px;border-radius:999px;text-decoration:none;font-weight:800;font-size:17px;display:inline-block;margin-bottom:20px;">Xác nhận email</a>
+        <p style="color:#6b7280;font-size:13px;margin:0 0 8px;">Nếu bạn không đăng ký S-Trip, hãy bỏ qua email này.</p>
+        <p style="color:#9ca3af;font-size:12px;margin:0;">© S-Trip — Khám phá Việt Nam</p>
+      </div>
+    </div>
+    """
+
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(mail_user, mail_pass)
+        server.sendmail(mail_user, to_email, msg.as_string())
+
+
 @auth_bp.route("/api/auth/forgot-password", methods=["POST"])
 def forgot_password():
     data  = request.get_json() or {}
@@ -699,4 +783,103 @@ def reset_password():
 
     except Exception as e:
         print(f"[reset_password] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ================================================================
+# ✉️ EMAIL VERIFICATION
+# ================================================================
+# Cần thêm vào Supabase SQL Editor:
+#
+# ALTER TABLE users
+#   ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN   DEFAULT TRUE,
+#   ADD COLUMN IF NOT EXISTS verify_token        TEXT      DEFAULT NULL,
+#   ADD COLUMN IF NOT EXISTS verify_token_expires BIGINT   DEFAULT NULL;
+# -- Lưu ý: DEFAULT TRUE giúp các tài khoản cũ (trước khi thêm tính năng) không bị chặn login
+# ================================================================
+
+@auth_bp.route("/api/auth/verify-email", methods=["POST"])
+def verify_email():
+    data  = request.get_json() or {}
+    token = (data.get("token") or "").strip()
+
+    if not token:
+        return jsonify({"success": False, "error": "Token không hợp lệ"}), 400
+
+    try:
+        sb = get_sb()
+
+        # Tìm user có verify_token khớp — token bị xóa sau khi dùng nên không tìm thấy = đã dùng rồi
+        res = sb.table("users").select("id,email,email_verified,verify_token_expires").eq("verify_token", token).execute()
+
+        if not res.data:
+            # Token không tồn tại: có thể đã xác nhận thành công trước đó (token bị xóa),
+            # hoặc token hoàn toàn sai. Không phân biệt được → trả lỗi chung.
+            return jsonify({"success": False, "error": "Link xác nhận không hợp lệ hoặc đã được sử dụng. Nếu bạn đã xác nhận rồi, hãy đăng nhập bình thường."}), 400
+
+        user = res.data[0]
+
+        # Guard: trường hợp token còn trong DB nhưng email đã verified (race condition)
+        if user.get("email_verified"):
+            # Xóa token thừa cho sạch
+            sb.table("users").update({"verify_token": None, "verify_token_expires": None}).eq("id", user["id"]).execute()
+            return jsonify({"success": True, "already_verified": True, "message": "Email của bạn đã được xác nhận trước đó."})
+
+        expires = user.get("verify_token_expires")
+        if expires and int(time.time()) > expires:
+            return jsonify({"success": False, "error": "Link xác nhận đã hết hạn (24h). Vui lòng yêu cầu gửi lại.", "expired": True}), 400
+
+        # Xác nhận email — xóa token ngay để không thể dùng lại
+        sb.table("users").update({
+            "email_verified":       True,
+            "verify_token":         None,
+            "verify_token_expires": None,
+        }).eq("id", user["id"]).execute()
+
+        # Tự động đăng nhập sau khi xác nhận
+        session["user_id"] = user["id"]
+        session.permanent  = True
+
+        full_user = sb.table("users").select("*").eq("id", user["id"]).execute().data[0]
+        return jsonify({"success": True, "user": _user_to_dict(full_user)})
+
+    except Exception as e:
+        print(f"[verify_email] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@auth_bp.route("/api/auth/resend-verification", methods=["POST"])
+def resend_verification():
+    data  = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email or "@" not in email:
+        return jsonify({"success": False, "error": "Email không hợp lệ"}), 400
+
+    try:
+        sb  = get_sb()
+        res = sb.table("users").select("id,email_verified").eq("email", email).execute()
+        if not res.data:
+            # Không tiết lộ email có tồn tại không
+            return jsonify({"success": True})
+
+        user = res.data[0]
+        if user.get("email_verified"):
+            return jsonify({"success": False, "error": "Email này đã được xác nhận rồi"}), 400
+
+        new_token   = secrets.token_urlsafe(32)
+        new_expires = int(time.time()) + 24 * 3600
+
+        sb.table("users").update({
+            "verify_token":         new_token,
+            "verify_token_expires": new_expires,
+        }).eq("id", user["id"]).execute()
+
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        _send_verification_email(email, new_token, frontend_url)
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        print(f"[resend_verification] Lỗi: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
