@@ -870,91 +870,13 @@ def activities():
 # ----------------------------------------------------------------
 from weather_service import get_weather as _get_weather
 
-_DAY_VI_MAIN = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
-
-def _filter_forecast_from_date(forecast: list, departure_date_str: str, target_days: int = 6) -> list:
-    """
-    Lọc forecast chỉ giữ các ngày >= departure_date,
-    sau đó pad thêm ngày ước tính (trung bình forecast có được) cho đủ target_days.
-    """
-    from datetime import datetime, timedelta
-    from collections import Counter
-    try:
-        dep = datetime.strptime(departure_date_str, "%Y-%m-%d")
-
-        # 1. Lọc ngày >= ngày đi
-        result = []
-        for f in forecast:
-            try:
-                day_str   = f.get("date", "")
-                candidate = datetime.strptime(f"{day_str}/{dep.year}", "%d/%m/%Y")
-                if candidate < dep.replace(month=1, day=1):
-                    candidate = candidate.replace(year=dep.year + 1)
-                if candidate.date() >= dep.date():
-                    result.append(f)
-            except Exception:
-                result.append(f)
-
-        # 2. Pad thêm ngày ước tính nếu chưa đủ target_days
-        if len(result) < target_days and forecast:
-            src = forecast
-
-            def _avg(key):
-                vals = [f[key] for f in src if f.get(key) is not None]
-                return round(sum(vals) / len(vals), 1) if vals else None
-
-            avg_high      = _avg("high_c")
-            avg_low       = _avg("low_c")
-            avg_rain      = int(sum(f.get("rain_chance", 0) for f in src) / len(src))
-            avg_condition = Counter(f.get("condition", "") for f in src).most_common(1)[0][0]
-            avg_icon      = Counter(f.get("icon", "")      for f in src).most_common(1)[0][0]
-
-            if result:
-                last_date_str = result[-1].get("date", "")
-                try:
-                    last_dt = datetime.strptime(f"{last_date_str}/{dep.year}", "%d/%m/%Y")
-                except Exception:
-                    last_dt = dep + timedelta(days=len(result) - 1)
-            else:
-                last_dt = dep - timedelta(days=1)
-
-            while len(result) < target_days:
-                next_dt = last_dt + timedelta(days=1)
-                result.append({
-                    "day":         _DAY_VI_MAIN[next_dt.weekday()],
-                    "date":        next_dt.strftime("%d/%m"),
-                    "high_c":      avg_high,
-                    "low_c":       avg_low,
-                    "condition":   avg_condition,
-                    "icon":        avg_icon,
-                    "rain_chance": avg_rain,
-                    "rain_hours":  [],
-                    "hourly":      [],
-                    "estimated":   True,
-                })
-                last_dt = next_dt
-
-        return result
-
-    except Exception:
-        return forecast   # Fallback: trả nguyên nếu lỗi parse ngày đi
-
-
 @app.route("/api/weather", methods=["GET"])
 def get_weather():
-    location       = request.args.get("location", "").strip()
-    lang           = request.args.get("lang", "vi")
-    departure_date = request.args.get("departure_date", "").strip()  # "YYYY-MM-DD", tuỳ chọn
-
+    location = request.args.get("location", "").strip()
+    lang     = request.args.get("lang", "vi")
     if not location:
         return jsonify({"success": False, "error": "Thiếu tham số location"}), 400
-
     result = _get_weather(SERPAPI_KEY, location, lang)
-
-    # Lọc forecast từ ngày đi trở đi (nếu frontend truyền departure_date)
-    if departure_date and result.get("success") and result.get("forecast"):
-        result["forecast"] = _filter_forecast_from_date(result["forecast"], departure_date)
-
     # Trả 200 kể cả khi lỗi — tránh frontend retry vô hạn
     # Chỉ 502 khi lỗi không mong đợi (exception thật)
     error_code = result.get("error_code", "")
@@ -999,7 +921,7 @@ def trip_save():
         meta    = body.get("meta", {})
         trip_id = _gen_id(json.dumps(body, ensure_ascii=False, sort_keys=True))
 
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         sb.table("trips").upsert({
             "id":          trip_id,
             "user_id":     str(uid) if uid else "anonymous",
@@ -1024,7 +946,7 @@ def trip_save():
 def trip_get(trip_id):
     """Trả về JSON data của trip (dùng cho frontend load lại lịch trình)."""
     try:
-        sb  = _get_supabase()
+        sb  = _get_supabase(uid)
         res = sb.table("trips").select("*").eq("id", trip_id).execute()
         if not res.data:
             return jsonify({"success": False, "error": "Không tìm thấy lịch trình"}), 404
@@ -1053,7 +975,7 @@ def my_trips():
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb  = _get_supabase()
+        sb  = _get_supabase(uid)
         res = (
             sb.table("trips")
             .select("id, location, origin, days, start_date, created_at")
@@ -1074,7 +996,7 @@ def my_trips_delete(trip_id):
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb  = _get_supabase()
+        sb  = _get_supabase(uid)
         res = (
             sb.table("trips")
             .delete()
@@ -1101,7 +1023,7 @@ def search_history_list():
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb  = _get_supabase()
+        sb  = _get_supabase(uid)
         res = (
             sb.table("search_history")
             .select("id, location, origin, budget, days, passengers, departure_date, searched_at")
@@ -1132,7 +1054,7 @@ def search_history_add():
         return jsonify({"success": False, "error": "Thiếu location"}), 400
 
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         sb.table("search_history").insert({
             "user_id":        str(uid),
             "location":       location,
@@ -1156,7 +1078,7 @@ def search_history_delete(history_id):
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb  = _get_supabase()
+        sb  = _get_supabase(uid)
         res = (
             sb.table("search_history")
             .delete()
@@ -1179,7 +1101,7 @@ def search_history_clear():
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         sb.table("search_history").delete().eq("user_id", str(uid)).execute()
         return jsonify({"success": True})
     except Exception as e:
@@ -1484,20 +1406,10 @@ def static_map():
 #   CREATE INDEX idx_saved_places_user_id ON saved_places(user_id);
 # ================================================================
 
-from supabase import create_client, Client as SupabaseClient
+from auth_routes import get_sb as _get_supabase_base
 
-_supabase_client: SupabaseClient | None = None
-
-def _get_supabase() -> SupabaseClient:
-    """Khởi tạo Supabase client 1 lần duy nhất (singleton)."""
-    global _supabase_client
-    if _supabase_client is None:
-        url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_SERVICE_KEY", "")
-        if not url or not key:
-            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_ANON_KEY trong .env")
-        _supabase_client = create_client(url, key)
-    return _supabase_client
+def _get_supabase(user_id=None):
+    return _get_supabase_base(user_id)
 
 def _sp_get_uid():
     from flask import session
@@ -1510,7 +1422,7 @@ def saved_places_list():
     if not uid:
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         res = (
             sb.table("saved_places")
             .select("id, name, location, rating, thumbnail, type, saved_at")
@@ -1539,7 +1451,7 @@ def saved_places_add():
         return jsonify({"success": False, "error": "Thiếu tên địa điểm"}), 400
 
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
 
         # Kiểm tra đã lưu chưa
         check = (
@@ -1583,7 +1495,7 @@ def saved_places_check():
     name     = request.args.get("name",     "").strip()
     location = request.args.get("location", "").strip()
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         res = (
             sb.table("saved_places")
             .select("id")
@@ -1609,7 +1521,7 @@ def saved_places_remove_by_name():
     location = (data.get("location", "") or "").strip()
 
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         res = (
             sb.table("saved_places")
             .delete()
@@ -1632,7 +1544,7 @@ def saved_places_delete(place_id):
         return jsonify({"success": False, "error": "Chưa đăng nhập"}), 401
 
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         res = (
             sb.table("saved_places")
             .delete()
@@ -1658,7 +1570,7 @@ def saved_places_update(place_id):
     new_thumbnail = data.get("thumbnail", "")
 
     try:
-        sb = _get_supabase()
+        sb = _get_supabase(uid)
         res = (
             sb.table("saved_places")
             .update({"thumbnail": to_proxy_url(new_thumbnail)})

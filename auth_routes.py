@@ -41,8 +41,10 @@
 #
 # ================================================================
 
-import os, bcrypt, json, time
-from datetime import datetime, timezone
+import os, bcrypt, json, time, secrets, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Blueprint, request, jsonify, session, redirect, url_for
 from authlib.integrations.flask_client import OAuth
@@ -67,17 +69,26 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # ----------------------------------------------------------------
-# 🔌 SUPABASE CLIENT
+# 🔌 SUPABASE CLIENT — dùng service role key
+# ----------------------------------------------------------------
+# Kiến trúc: Browser → Flask (kiểm tra session) → Supabase
+# Flask đã là người gác cổng nên dùng service role key để bypass RLS,
+# không cần tự ký JWT thủ công.
+# Lấy service role key tại: Supabase Dashboard → Settings → API → service_role
 # ----------------------------------------------------------------
 _sb: SupabaseClient | None = None
 
-def get_sb() -> SupabaseClient:
+def get_sb(user_id=None) -> SupabaseClient:
+    """
+    Trả Supabase client dùng service role key.
+    Tham số user_id giữ lại để tương thích với code cũ, không dùng nữa.
+    """
     global _sb
+    url = os.getenv("SUPABASE_URL", "")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY")
     if _sb is None:
-        url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_SERVICE_KEY", "")
-        if not url or not key:
-            raise RuntimeError("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY")
         _sb = create_client(url, key)
     return _sb
 
@@ -91,6 +102,7 @@ def _user_to_dict(user: dict) -> dict:
         "name":       user["name"],
         "avatar":     user.get("avatar") or "",
         "google_id":  user.get("google_id") or "",
+        "role":       user.get("role") or "user",
         "created_at": str(user.get("created_at") or ""),
     }
 
@@ -189,7 +201,7 @@ def me():
     if not user_id:
         return jsonify({"success": False, "user": None})
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("users").select("*").eq("id", user_id).execute()
         if not res.data:
             session.clear()
@@ -246,9 +258,9 @@ def google_callback():
 
         if existing.data:
             user = existing.data[0]
-            if not user.get("google_id"):
-                sb.table("users").update({"google_id": google_id, "avatar": avatar}).eq("id", user["id"]).execute()
             user_id = user["id"]
+            if not user.get("google_id"):
+                sb.table("users").update({"google_id": google_id, "avatar": avatar}).eq("id", user_id).execute()
         else:
             res = sb.table("users").insert({
                 "email": email, "name": name, "avatar": avatar, "google_id": google_id
@@ -274,7 +286,7 @@ def google_callback():
 def get_schedules():
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("schedules").select("id,title,location,days,data_json,created_at,updated_at").eq("user_id", user_id).order("updated_at", desc=True).execute()
         return jsonify({"success": True, "schedules": res.data or []})
     except Exception as e:
@@ -286,7 +298,7 @@ def get_schedules():
 def get_schedule(schedule_id):
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("schedules").select("*").eq("id", schedule_id).eq("user_id", user_id).execute()
         if not res.data:
             return jsonify({"success": False, "error": "Không tìm thấy"}), 404
@@ -312,7 +324,7 @@ def save_schedule():
         return jsonify({"success": False, "error": "Thiếu thông tin điểm đến"}), 400
 
     try:
-        sb = get_sb()
+        sb = get_sb(user_id)
         if schedule_id:
             existing = sb.table("schedules").select("id").eq("id", schedule_id).eq("user_id", user_id).execute()
             if not existing.data:
@@ -338,7 +350,7 @@ def save_schedule():
 def delete_schedule(schedule_id):
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("schedules").delete().eq("id", schedule_id).eq("user_id", user_id).execute()
         if not res.data:
             return jsonify({"success": False, "error": "Không tìm thấy"}), 404
@@ -371,7 +383,7 @@ def update_avatar():
     avatar_url = f"{request.host_url}static/avatars/{filename}"
 
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         sb.table("users").update({"avatar": avatar_url}).eq("id", user_id).execute()
         res = sb.table("users").select("*").eq("id", user_id).execute()
         return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
@@ -389,7 +401,7 @@ def update_profile():
 
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         sb.table("users").update({"name": name}).eq("id", user_id).execute()
         res = sb.table("users").select("*").eq("id", user_id).execute()
         return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
@@ -409,7 +421,7 @@ def change_password():
         return jsonify({"success": False, "error": "Mật khẩu mới phải ít nhất 6 ký tự"}), 400
 
     try:
-        sb   = get_sb()
+        sb   = get_sb(user_id)
         res  = sb.table("users").select("password_hash").eq("id", user_id).execute()
         user = res.data[0]
 
@@ -434,7 +446,7 @@ def change_password():
 def get_favorites():
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("favorites").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
         return jsonify({"success": True, "favorites": res.data or []})
     except Exception as e:
@@ -456,7 +468,7 @@ def add_favorite():
         return jsonify({"success": False, "error": "Thiếu tên địa điểm"}), 400
 
     try:
-        sb = get_sb()
+        sb = get_sb(user_id)
         existing = sb.table("favorites").select("id").eq("user_id", user_id).eq("name", name).eq("location", location).execute()
         if existing.data:
             return jsonify({"success": True, "id": existing.data[0]["id"], "duplicate": True})
@@ -475,7 +487,7 @@ def add_favorite():
 def delete_favorite(fav_id):
     user_id = session["user_id"]
     try:
-        get_sb().table("favorites").delete().eq("id", fav_id).eq("user_id", user_id).execute()
+        get_sb(user_id).table("favorites").delete().eq("id", fav_id).eq("user_id", user_id).execute()
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -489,7 +501,7 @@ def remove_favorite_by_name():
     name     = (data.get("name") or "").strip()
     location = (data.get("location") or "").strip()
     try:
-        get_sb().table("favorites").delete().eq("user_id", user_id).eq("name", name).eq("location", location).execute()
+        get_sb(user_id).table("favorites").delete().eq("user_id", user_id).eq("name", name).eq("location", location).execute()
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -504,7 +516,7 @@ def remove_favorite_by_name():
 def get_search_history():
     user_id = session["user_id"]
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("search_history").select("*").eq("user_id", str(user_id)).order("searched_at", desc=True).limit(20).execute()
         return jsonify({"success": True, "history": res.data or []})
     except Exception as e:
@@ -522,7 +534,7 @@ def add_search_history():
         return jsonify({"success": False, "error": "Thiếu điểm đến"}), 400
 
     try:
-        sb  = get_sb()
+        sb  = get_sb(user_id)
         res = sb.table("search_history").insert({
             "user_id":        str(user_id),
             "location":       location,
@@ -543,7 +555,7 @@ def add_search_history():
 def delete_search_history(history_id):
     user_id = session["user_id"]
     try:
-        get_sb().table("search_history").delete().eq("id", history_id).eq("user_id", str(user_id)).execute()
+        get_sb(user_id).table("search_history").delete().eq("id", history_id).eq("user_id", str(user_id)).execute()
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -554,7 +566,137 @@ def delete_search_history(history_id):
 def clear_search_history():
     user_id = session["user_id"]
     try:
-        get_sb().table("search_history").delete().eq("user_id", str(user_id)).execute()
+        get_sb(user_id).table("search_history").delete().eq("user_id", str(user_id)).execute()
         return jsonify({"success": True})
     except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ================================================================
+# 🔑 FORGOT / RESET PASSWORD
+# ================================================================
+# Cần thêm vào Supabase SQL Editor:
+#
+# CREATE TABLE password_reset_tokens (
+#     id         BIGSERIAL PRIMARY KEY,
+#     email      TEXT NOT NULL,
+#     token      TEXT NOT NULL UNIQUE,
+#     expires_at BIGINT NOT NULL,
+#     used       BOOLEAN DEFAULT FALSE,
+#     created_at TIMESTAMPTZ DEFAULT NOW()
+# );
+# ================================================================
+
+def _send_reset_email(to_email: str, token: str, frontend_url: str):
+    """Gửi email chứa link reset mật khẩu qua Gmail."""
+    mail_user = os.getenv("MAIL_EMAIL", "")
+    mail_pass = os.getenv("MAIL_PASSWORD", "")
+    if not mail_user or not mail_pass:
+        raise RuntimeError("Thiếu MAIL_EMAIL hoặc MAIL_PASSWORD trong .env")
+
+    reset_link = f"{frontend_url}/#/reset-password?token={token}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "[S-Trip] Đặt lại mật khẩu của bạn"
+    msg["From"]    = f"S-Trip <{mail_user}>"
+    msg["To"]      = to_email
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:40px 30px;background:#f9fafb;border-radius:16px;">
+      <div style="text-align:center;">
+        <div style="display:inline-flex;align-items:center;gap:10px;margin-bottom:20px;">
+          <img src="https://glghrxqpowifcofofsfg.supabase.co/storage/v1/object/public/assets/S.jpg" style="width:44px;height:44px;border-radius:50%;object-fit:cover;vertical-align:middle;" alt="S-Trip"/>
+          <h2 style="color:#10b981;margin:0;font-size:24px;line-height:44px;">S-Trip</h2>
+        </div>
+        <h3 style="color:#111827;margin:0 0 12px;">Đặt lại mật khẩu</h3>
+        <p style="color:#374151;margin:0 0 20px;">Bấm nút bên dưới để đặt lại mật khẩu (hiệu lực <strong>15 phút</strong>):</p>
+        <a href="{reset_link}" style="background:#10b981;color:white;padding:14px 36px;border-radius:999px;text-decoration:none;font-weight:800;font-size:17px;display:inline-block;margin-bottom:20px;">Đặt lại mật khẩu</a>
+        <p style="color:#9ca3af;font-size:12px;margin:0;">© S-Trip — Khám phá Việt Nam</p>
+      </div>
+    </div>
+    """
+
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(mail_user, mail_pass)
+        server.sendmail(mail_user, to_email, msg.as_string())
+
+
+@auth_bp.route("/api/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    data  = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email or "@" not in email:
+        return jsonify({"success": False, "error": "Email không hợp lệ"}), 400
+
+    try:
+        sb = get_sb()
+
+        # Kiểm tra email có tồn tại không
+        res = sb.table("users").select("id,email").eq("email", email).execute()
+        if not res.data:
+            # Không báo lỗi rõ để tránh dò email — vẫn trả success
+            return jsonify({"success": True})
+
+        # Tạo token ngẫu nhiên, hết hạn sau 15 phút
+        token      = secrets.token_urlsafe(32)
+        expires_at = int(time.time()) + 15 * 60
+
+        # Lưu token vào DB
+        sb.table("password_reset_tokens").insert({
+            "email":      email,
+            "token":      token,
+            "expires_at": expires_at,
+            "used":       False,
+        }).execute()
+
+        # Gửi email
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        _send_reset_email(email, token, frontend_url)
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        print(f"[forgot_password] Lỗi: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@auth_bp.route("/api/auth/reset-password", methods=["POST"])
+def reset_password():
+    data         = request.get_json() or {}
+    token        = (data.get("token") or "").strip()
+    new_password = data.get("new_password") or ""
+
+    if not token:
+        return jsonify({"success": False, "error": "Token không hợp lệ"}), 400
+    if len(new_password) < 6:
+        return jsonify({"success": False, "error": "Mật khẩu phải ít nhất 6 ký tự"}), 400
+
+    try:
+        sb = get_sb()
+
+        # Tìm token
+        res = sb.table("password_reset_tokens").select("*").eq("token", token).execute()
+        if not res.data:
+            return jsonify({"success": False, "error": "Link không hợp lệ hoặc đã hết hạn"}), 400
+
+        record = res.data[0]
+
+        if record["used"]:
+            return jsonify({"success": False, "error": "Link này đã được sử dụng rồi"}), 400
+        if int(time.time()) > record["expires_at"]:
+            return jsonify({"success": False, "error": "Link đã hết hạn, vui lòng yêu cầu lại"}), 400
+
+        # Cập nhật mật khẩu mới
+        new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+        sb.table("users").update({"password_hash": new_hash}).eq("email", record["email"]).execute()
+
+        # Đánh dấu token đã dùng
+        sb.table("password_reset_tokens").update({"used": True}).eq("token", token).execute()
+
+        return jsonify({"success": True, "message": "Đặt lại mật khẩu thành công"})
+
+    except Exception as e:
+        print(f"[reset_password] Lỗi: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
