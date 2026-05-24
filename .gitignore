@@ -8,6 +8,7 @@ venv/
 env/
 *.pyc
 *.pyo
+node_modules/
 
 # Biến môi trường (Bảo mật)
 .env
