@@ -481,7 +481,9 @@ def plan_trip():
         dest_info   = resolve_airport(location)
 
         no_airport  = dest_info["no_airport"] or origin_info["no_airport"]
-        flight_note = dest_info.get("note") or origin_info.get("note") or ""
+        # ✅ Gộp cả 2 note thay vì bỏ mất 1 bên
+        _notes = [n for n in [dest_info.get("note"), origin_info.get("note")] if n]
+        flight_note = " | ".join(_notes) if _notes else ""
 
         # ── 4. LẤY CHUYẾN BAY THẬT SỰ TỪ API ────────
         FLIGHT_THRESHOLD_M = 150_000  # > 150km mới kích hoạt tìm máy bay

@@ -232,23 +232,23 @@ def is_route_operated(iata_a: str, iata_b: str) -> bool:
 # ---------------------------------------------------------------------------
 _IATA_HUB_CANDIDATES: dict[str, list[str]] = {
     # Miền Nam
-    "CAH": ["VCA", "SGN"],          # Cà Mau → Cần Thơ hoặc SGN
+    "CAH": ["SGN"],                 # Cà Mau → SGN (CAH-VCA không có route thực tế)
     "VCA": ["SGN", "HAN"],
-    "VKG": ["PQC", "SGN"],          # Rạch Giá → Phú Quốc hoặc SGN
+    "VKG": ["SGN"],                 # Rạch Giá → SGN (VKG-PQC không có route thực tế)
     "PQC": ["SGN", "HAN"],
     # Miền Trung - Nam
-    "PHH": ["SGN", "HAN"],
+    "PHH": ["SGN"],                 # Phan Thiết → SGN (PHH-HAN không có route thực tế)
     "DLI": ["SGN", "HAN"],
     "BMV": ["SGN", "HAN", "DAD"],
-    "PXU": ["SGN", "HAN", "DAD"],
+    "PXU": ["SGN", "HAN"],          # Pleiku: PXU-DAD không có route thực tế
     "UIH": ["SGN", "DAD", "HAN"],
-    "TBB": ["CXR", "SGN", "HAN"],   # Tuy Hòa → Nha Trang (CXR) gần hơn
+    "TBB": ["SGN", "HAN"],          # Tuy Hòa: TBB-CXR không có route thực tế
     "VCL": ["DAD", "SGN", "HAN"],   # Chu Lai → Đà Nẵng
     # Miền Bắc
     "DIN": ["HAN"],
     "SQH": ["HAN"],
-    "VDH": ["HUI", "HAN", "DAD"],   # Đồng Hới → Huế hoặc HAN
-    "VII": ["HAN", "DAD"],
+    "VDH": ["HAN"],                 # Đồng Hới: VDH-HUI và VDH-DAD không có route thực tế
+    "VII": ["HAN"],                 # Vinh: VII-DAD không có route thực tế
 }
 
 # Giữ lại để không break import cũ từ main.py
@@ -706,14 +706,34 @@ def get_smart_flight_recommendations(
 
         # ---------------------------------------------------------------------------
         # 🔀 FALLBACK HUB: thử hub thay thế khi tuyến thực tế không có vé
+        # Điều kiện bắt buộc: tuyến dep→arr phải đủ xa (> MIN_FLIGHT_DISTANCE_KM)
+        # và hub phải gần điểm đến/xuất phát hơn — tránh trả vé đi ngược chiều
         # ---------------------------------------------------------------------------
         dep_upper = departure_id.upper()
         arr_upper = arrival_id.upper()
+
+        # Nếu tuyến quá gần (< 350km) thì không cần fallback hub — đi xe hợp lý hơn
+        dist_dep_arr = _iata_distance_km(dep_upper, arr_upper)
+        if dist_dep_arr is not None and dist_dep_arr < 350:
+            print(f"[Flight] ⛔ Tuyến {dep_upper}→{arr_upper} chỉ {dist_dep_arr:.0f}km — không fallback hub, đề xuất đi xe.")
+            return []
+
+        # Dùng giá trị thực hoặc ngưỡng an toàn nhỏ (không dùng 9999 tránh pass nhầm)
+        dist_dep_arr_safe = dist_dep_arr if dist_dep_arr else 500
 
         # Hub fallback cho arrival (bay vào hub gần điểm đến)
         arr_hubs = [h for h in _IATA_HUB_CANDIDATES.get(arr_upper, [])
                     if h != arr_upper and h != dep_upper and is_route_operated(dep_upper, h)]
         for hub in arr_hubs:
+            dist_hub_arr = _iata_distance_km(hub, arr_upper)
+            dist_dep_hub = _iata_distance_km(dep_upper, hub)
+            # Hub phải gần điểm đến hơn khoảng cách dep→arr, và không xa hơn dep→arr
+            if dist_hub_arr is not None and dist_hub_arr >= dist_dep_arr_safe:
+                print(f"[Flight] ⛔ Bỏ qua arr hub {hub}: dist_hub_arr={dist_hub_arr:.0f}km ≥ dep_arr={dist_dep_arr_safe:.0f}km")
+                continue
+            if dist_dep_hub is not None and dist_dep_hub >= dist_dep_arr_safe:
+                print(f"[Flight] ⛔ Bỏ qua arr hub {hub}: dist_dep_hub={dist_dep_hub:.0f}km ≥ dep_arr={dist_dep_arr_safe:.0f}km")
+                continue
             print(f"[Flight] 🔀 Thử fallback arrival hub: {dep_upper} → {hub} (thay vì {arr_upper})")
             fallback = _fetch_flights_for_date_iata(dep_upper, hub, outbound_dt, passengers, api_key)
             if fallback:
@@ -726,6 +746,10 @@ def get_smart_flight_recommendations(
         dep_hubs = [h for h in _IATA_HUB_CANDIDATES.get(dep_upper, [])
                     if h != dep_upper and h != arr_upper and is_route_operated(h, arr_upper)]
         for hub in dep_hubs:
+            dist_hub_dep = _iata_distance_km(hub, dep_upper)
+            if dist_hub_dep is not None and dist_hub_dep >= dist_dep_arr_safe:
+                print(f"[Flight] ⛔ Bỏ qua dep hub {hub}: dist_hub_dep={dist_hub_dep:.0f}km ≥ dep_arr={dist_dep_arr_safe:.0f}km")
+                continue
             print(f"[Flight] 🔀 Thử fallback departure hub: {hub} → {arr_upper} (thay vì {dep_upper})")
             fallback = _fetch_flights_for_date_iata(hub, arr_upper, outbound_dt, passengers, api_key)
             if fallback:
