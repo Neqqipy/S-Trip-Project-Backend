@@ -15,6 +15,8 @@ from direction_service import get_all_modes_directions
 from transport_service import decide_transport
 from auth_routes import auth_bp, init_oauth 
 from itinerary_builder import build_itinerary
+from ThuatToanDeXuat import apply_recommendation_algorithm
+
 
 load_dotenv()
 app = Flask(__name__)
@@ -548,7 +550,7 @@ def plan_trip():
             effective_origin_iata = effective_origin_iata,
             effective_dest_iata   = effective_dest_iata,
         )
-
+         hotels, tours, foods = apply_recommendation_algorithm(hotels, tours, foods, budget)
         return jsonify({
             "success": True,
             "plan": {
