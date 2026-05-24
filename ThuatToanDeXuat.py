@@ -16,7 +16,7 @@ PRICE_FLOOR_RATIO = 0.25   # dưới 25% max_per_night → điểm giá = 0
 
 MIN_REVIEWS       = 50
 SYSTEM_AVG_RATING = 4.2
-MAX_DISTANCE_KM   = 30
+MAX_DISTANCE_KM   = 25
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +271,7 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
 
     # Chấm tours theo khoảng cách tới khách sạn (điểm xuất phát mỗi ngày)
     # Ngưỡng 13km chim bay ≈ 20km đường bộ (hệ số ~1.5x)
+    # Đồng bộ với ngưỡng d <= 13 trong itinerary_builder._next_tour
     MAX_KM = 13
 
     valid_tours = []
@@ -281,11 +282,17 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(t, hotel_lat, hotel_lng, ideal_price, 100_000), 4
             )
             valid_tours.append(t)
-
+    
     valid_tours.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     tours = valid_tours
 
-    # ... (lấy trung tâm tour) ...
+    # Trung tâm của tours (top 10 điểm cao nhất, sau khi sort)
+    # → dùng làm gốc chấm food SƠ BỘ; pick_food_for_slot() sẽ tinh chỉnh per-slot
+    tour_center_lat, tour_center_lng = _centroid(tours[:10])
+
+    # Fallback: nếu tours không có tọa độ, dùng khách sạn
+    if tour_center_lat is None:
+        tour_center_lat, tour_center_lng = hotel_lat, hotel_lng
 
     valid_foods = []
     for f in foods:
@@ -295,7 +302,7 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(f, tour_center_lat, tour_center_lng, ideal_price, 150_000), 4
             )
             valid_foods.append(f)
-
+            
     valid_foods.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     foods = valid_foods
 

@@ -277,7 +277,13 @@ def init_oauth(app):
 def google_login():
     if not _oauth_instance:
         return jsonify({"error": "OAuth chưa được khởi tạo"}), 500
-    redirect_uri = url_for("auth.google_callback", _external=True)
+
+    # Dùng BACKEND_URL từ .env thay vì url_for()
+    # → tránh sai URL khi chạy trên Codespaces / reverse proxy
+    backend_url  = os.getenv("BACKEND_URL", "http://localhost:5000")
+    redirect_uri = f"{backend_url}/api/auth/google/callback"
+    print(f"🔍 redirect_uri: {redirect_uri}")
+
     return _oauth_instance.google.authorize_redirect(
         redirect_uri,
         prompt="select_account"

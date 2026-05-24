@@ -24,10 +24,13 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "dev-key")
 app.permanent_session_lifetime = timedelta(days=30)
 
-# SESSION COOKIE config
-# Khi deploy HTTPS: set FLASK_ENV=production hoac HTTPS=true trong .env
-# Khi dev HTTP localhost: Lax + Secure=False (default)
-_IS_HTTPS = os.getenv('FLASK_ENV', 'development') == 'production' or os.getenv('HTTPS', '') == 'true'
+# Khi deploy HTTPS / Codespaces: HTTPS=true trong .env
+# Khi dev localhost: để mặc định (không cần set gì)
+_IS_HTTPS = (
+    os.getenv('FLASK_ENV', 'development') == 'production'
+    or os.getenv('HTTPS', '') == 'true'
+)
+
 app.config.update(
     SESSION_COOKIE_SAMESITE='None' if _IS_HTTPS else 'Lax',
     SESSION_COOKIE_SECURE=_IS_HTTPS,
@@ -36,13 +39,17 @@ app.config.update(
     SESSION_COOKIE_DOMAIN=None,
 )
 
-# FIX CORS: must specify origins explicitly
-# Browser blocks cookies when using wildcard '*' with credentials:true
-_FRONTEND_ORIGINS = [
-    os.getenv("FRONTEND_URL", "http://localhost:3000"),
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+# CORS: hỗ trợ nhiều FRONTEND_URL cách nhau bằng dấu phẩy
+# Ví dụ .env Codespaces:
+#   FRONTEND_URL=https://ten-codespace-3000.app.github.dev
+# Ví dụ .env localhost: để trống hoặc http://localhost:3000
+_raw_origins = os.getenv("FRONTEND_URL", "http://localhost:3000")
+_FRONTEND_ORIGINS = list({
+    o.strip()
+    for o in _raw_origins.split(",")
+    if o.strip()
+} | {"http://localhost:3000", "http://127.0.0.1:3000"})
+
 CORS(app, supports_credentials=True, origins=_FRONTEND_ORIGINS)
 
 app.register_blueprint(auth_bp)
