@@ -550,7 +550,7 @@ def plan_trip():
             effective_origin_iata = effective_origin_iata,
             effective_dest_iata   = effective_dest_iata,
         )
-         hotels, tours, foods = apply_recommendation_algorithm(hotels, tours, foods, budget)
+        hotels, tours, foods = apply_recommendation_algorithm(hotels, tours, foods, budget)
         return jsonify({
             "success": True,
             "plan": {

@@ -190,7 +190,7 @@ def build_itinerary(
     tour_pools = _split_tours([dict(t) for t in tours])
     all_foods  = [dict(f) for f in foods]   # pool toàn bộ, không chia theo buổi
 
-   used_tour_names: set = set()
+    used_tour_names: set = set()
     used_food_names: set = set()  # Đưa hẳn ra ngoài để KHÔNG lặp lại quán ngon giữa các ngày
     
     hotel_lat, hotel_lng = None, None
