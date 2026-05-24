@@ -1,4 +1,4 @@
-﻿import math
+import math
 import re
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,8 @@ MAX_DISTANCE_KM   = 30
 
 def haversine(lat1, lon1, lat2, lon2):
     """Tính khoảng cách đường chim bay (km) giữa 2 tọa độ."""
-   if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+    # Dùng is None thay vì not all([...]) vì trong Python số 0 là falsy
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return 999.0
     try:
         lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
@@ -261,12 +262,17 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
 
     Việc tối ưu thứ tự đi lại theo ngày/buổi được xử lý bởi itinerary_builder.py.
     """
+    if not hotels or not tours:
+        return hotels, tours, foods
+
     hotel_lat   = float(hotels[0].get("lat", 0) or 0)
     hotel_lng   = float(hotels[0].get("lng", 0) or 0)
     ideal_price = (budget * 0.2) / 3
+
     # Chấm tours theo khoảng cách tới khách sạn (điểm xuất phát mỗi ngày)
     # Ngưỡng 13km chim bay ≈ 20km đường bộ (hệ số ~1.5x)
     MAX_KM = 13
+
     valid_tours = []
     for t in tours:
         dist = haversine(hotel_lat, hotel_lng, t.get("lat"), t.get("lng"))
@@ -275,10 +281,12 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(t, hotel_lat, hotel_lng, ideal_price, 100_000), 4
             )
             valid_tours.append(t)
-    
+
     valid_tours.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     tours = valid_tours
+
     # ... (lấy trung tâm tour) ...
+
     valid_foods = []
     for f in foods:
         dist_hotel = haversine(hotel_lat, hotel_lng, f.get("lat"), f.get("lng"))
@@ -287,7 +295,7 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(f, tour_center_lat, tour_center_lng, ideal_price, 150_000), 4
             )
             valid_foods.append(f)
-            
+
     valid_foods.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     foods = valid_foods
 
