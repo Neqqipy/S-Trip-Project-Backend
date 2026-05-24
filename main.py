@@ -362,6 +362,8 @@ def get_real_activities(location, query_type):
             desc = r.get("description", f"Địa điểm {query_type} nổi tiếng.")
             coords = r.get("gps_coordinates", {})
 
+            price = r.get("price", "Giá tuỳ chọn")
+
             # FIX MAP: SerpAPI trả 2 loại ID:
             # - place_id dạng "ChIJ..." → dùng cho Google Maps Embed / Places API
             # - data_id  dạng "0x..."   → chỉ dùng nội bộ với google_maps_photos
@@ -373,7 +375,7 @@ def get_real_activities(location, query_type):
             processed_results.append({
                 "name":      name,
                 "rating":    str(r.get("rating", "4.5")),
-                "price":     "Giá tùy chọn",
+                "price":     price,
                 "desc":      desc,
                 "thumbnail": to_proxy_url(img_url),
                 "lat":       coords.get("latitude"),
