@@ -282,12 +282,15 @@ def google_login():
     if not _oauth_instance:
         return jsonify({"error": "OAuth chưa được khởi tạo"}), 500
     redirect_uri = url_for("auth.google_callback", _external=True)
-    return _oauth_instance.google.authorize_redirect(redirect_uri)
+    return _oauth_instance.google.authorize_redirect(
+        redirect_uri,
+        prompt="select_account"
+    )
 
 @auth_bp.route("/api/auth/google/callback")
 def google_callback():
     if not _oauth_instance:
-        return redirect(f"{FRONTEND_URL}?auth_error=oauth_not_init")
+        return redirect(f"{FRONTEND_URL}/#/?auth_error=oauth_not_init")
     try:
         token     = _oauth_instance.google.authorize_access_token()
         user_info = token.get("userinfo") or _oauth_instance.google.userinfo()
@@ -298,7 +301,7 @@ def google_callback():
         google_id = user_info.get("sub") or ""
 
         if not email:
-            return redirect(f"{FRONTEND_URL}?auth_error=no_email")
+            return redirect(f"{FRONTEND_URL}/#/?auth_error=no_email")
 
         sb = get_sb()
         existing = sb.table("users").select("*").eq("email", email).execute()
@@ -306,22 +309,61 @@ def google_callback():
         if existing.data:
             user = existing.data[0]
             user_id = user["id"]
+            update_data = {}
             if not user.get("google_id"):
-                sb.table("users").update({"google_id": google_id, "avatar": avatar}).eq("id", user_id).execute()
+                update_data["google_id"] = google_id
+            if not user.get("avatar") and avatar:
+                update_data["avatar"] = avatar
+            # Đảm bảo user Google luôn được coi là đã xác nhận email
+            if not user.get("email_verified"):
+                update_data["email_verified"] = True
+            if update_data:
+                sb.table("users").update(update_data).eq("id", user_id).execute()
         else:
+            # Tạo username tự động từ email (phần trước @), đảm bảo unique
+            base_username = email.split("@")[0].lower()
+            base_username = "".join(c for c in base_username if c.isalnum() or c == "_")[:20]
+            username_candidate = base_username
+            suffix = 1
+            while True:
+                check = sb.table("users").select("id").eq("username", username_candidate).execute()
+                if not check.data:
+                    break
+                username_candidate = f"{base_username}{suffix}"
+                suffix += 1
+
             res = sb.table("users").insert({
-                "email": email, "name": name, "avatar": avatar, "google_id": google_id
+                "email":          email,
+                "name":           name,
+                "avatar":         avatar,
+                "google_id":      google_id,
+                "username":       username_candidate,
+                "email_verified": True,   # Google đã xác thực email rồi
             }).execute()
             user_id = res.data[0]["id"]
 
         session["user_id"] = user_id
         session.permanent  = True
-        # Luôn redirect về root để ?auth_success=1 không bị hash nuốt
-        return redirect(f"{FRONTEND_URL}/?auth_success=1")
+
+        # Lấy user data mới nhất để nhúng vào URL cho React dùng luôn
+        # (tránh phụ thuộc cookie cross-port khi dùng proxy)
+        fresh = sb.table("users").select("*").eq("id", user_id).execute().data[0]
+        user_payload = {
+            "id":        fresh["id"],
+            "email":     fresh["email"],
+            "name":      fresh["name"],
+            "avatar":    fresh.get("avatar") or "",
+            "google_id": fresh.get("google_id") or "",
+            "username":  fresh.get("username") or "",
+            "role":      fresh.get("role") or "user",
+        }
+        import urllib.parse, json as _json
+        encoded = urllib.parse.quote(_json.dumps(user_payload, ensure_ascii=False), safe="")
+        return redirect(f"{FRONTEND_URL}/#/?auth_success=1&user={encoded}")
 
     except Exception as e:
         print(f"[Google OAuth Error] {e}")
-        return redirect(f"{FRONTEND_URL}?auth_error=oauth_failed")
+        return redirect(f"{FRONTEND_URL}/#/?auth_error=oauth_failed")
 
 
 # ----------------------------------------------------------------

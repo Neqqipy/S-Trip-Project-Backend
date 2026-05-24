@@ -22,13 +22,16 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "dev-key")
 app.permanent_session_lifetime = timedelta(days=30)
 
-# FIX SESSION COOKIE: SameSite=None bi chon tren HTTP localhost
-# Dung 'Lax' cho dev HTTP, chi dung 'None' khi deploy HTTPS
+# SESSION COOKIE config
+# Khi deploy HTTPS: set FLASK_ENV=production hoac HTTPS=true trong .env
+# Khi dev HTTP localhost: Lax + Secure=False (default)
+_IS_HTTPS = os.getenv('FLASK_ENV', 'development') == 'production' or os.getenv('HTTPS', '') == 'true'
 app.config.update(
-    SESSION_COOKIE_SAMESITE='Lax',
-    SESSION_COOKIE_SECURE=False,      # Chrome 148+ cho phep None+HTTP tren localhost
+    SESSION_COOKIE_SAMESITE='None' if _IS_HTTPS else 'Lax',
+    SESSION_COOKIE_SECURE=_IS_HTTPS,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_NAME='strip_session',
+    SESSION_COOKIE_DOMAIN=None,
 )
 
 # FIX CORS: must specify origins explicitly
