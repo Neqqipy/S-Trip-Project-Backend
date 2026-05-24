@@ -48,7 +48,6 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import Blueprint, request, jsonify, session, redirect, url_for
 from authlib.integrations.flask_client import OAuth
-from werkzeug.utils import secure_filename
 from supabase import create_client, Client as SupabaseClient
 
 auth_bp = Blueprint("auth", __name__)
@@ -60,9 +59,6 @@ GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
-# Thư mục lưu avatar local (fallback khi chưa có cloud storage)
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "static", "avatars")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
 def allowed_file(filename):
@@ -464,15 +460,24 @@ def update_avatar():
     if not allowed_file(file.filename):
         return jsonify({"success": False, "error": "Chỉ chấp nhận file ảnh (png, jpg, jpeg, gif, webp)"}), 400
 
-    user_id  = session["user_id"]
-    filename = secure_filename(f"user_{user_id}_{file.filename}")
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
-
-    avatar_url = f"{request.host_url}static/avatars/{filename}"
+    user_id   = session["user_id"]
+    ext       = file.filename.rsplit('.', 1)[1].lower()
+    filename  = f"avatars/user_{user_id}.{ext}"  # ghi đè file cũ luôn
+    file_bytes = file.read()
 
     try:
-        sb  = get_sb(user_id)
+        sb = get_sb(user_id)
+
+        # Upload lên Supabase Storage bucket "avatars" (tạo bucket này trong Dashboard nếu chưa có)
+        sb.storage.from_("avatars").upload(
+            filename,
+            file_bytes,
+            {"content-type": file.content_type or f"image/{ext}", "upsert": "true"},
+        )
+
+        # Lấy public URL
+        avatar_url = sb.storage.from_("avatars").get_public_url(filename)
+
         sb.table("users").update({"avatar": avatar_url}).eq("id", user_id).execute()
         res = sb.table("users").select("*").eq("id", user_id).execute()
         return jsonify({"success": True, "user": _user_to_dict(res.data[0])})
