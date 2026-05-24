@@ -79,7 +79,14 @@ def _dist(lat1, lon1, lat2, lon2) -> float:
     dl = math.radians(lon2 - lon1)
     a  = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Đánh giá quy mô tour để quyết định có ghép thêm điểm không
+# ─────────────────────────────────────────────────────────────────────────────
+def is_big_tour(tour_name: str) -> bool:
+    if not tour_name: return False
+    name_lower = tour_name.lower()
+    keywords = ["khu du lịch", "bà nà", "bana", "sun world", "vinpearl", "công viên", "safari", "núi", "đảo", "rừng", "quốc gia", "hills", "ngũ hành sơn", "sơn trà", "biển", "suối", "resort"]
+    return any(kw in name_lower for kw in keywords)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: chọn quán ăn gần midpoint giữa tour trước và tour sau
@@ -183,104 +190,137 @@ def build_itinerary(
     tour_pools = _split_tours([dict(t) for t in tours])
     all_foods  = [dict(f) for f in foods]   # pool toàn bộ, không chia theo buổi
 
-    used_tour_names: set = set()
-
-    def _next_tour(slot_key: str) -> Optional[dict]:
-        """Lấy tour chưa dùng từ slot đúng, fallback sang slot còn hàng."""
+   used_tour_names: set = set()
+    used_food_names: set = set()  # Đưa hẳn ra ngoài để KHÔNG lặp lại quán ngon giữa các ngày
+    
+    hotel_lat, hotel_lng = None, None
+    if hotels:
+        hotel_lat = float(hotels[0].get("lat", 0) or 0)
+        hotel_lng = float(hotels[0].get("lng", 0) or 0)
+    def _next_tour(slot_key: str, curr_lat: float, curr_lng: float, peek: bool = False) -> Optional[dict]:
+        """Lấy tour chưa dùng từ slot đúng. Kiểm tra khoảng cách đường chim bay <= 13km"""
         for try_slot in [slot_key, SLOT_MORNING, SLOT_AFTERNOON, SLOT_EVENING]:
             pool = tour_pools.get(try_slot, [])
             for t in pool:
-                if t.get("name") not in used_tour_names:
-                    used_tour_names.add(t.get("name"))
+                name = t.get("name")
+                if name not in used_tour_names:
+                    # Kiểm tra khoảng cách di chuyển từ điểm hiện tại
+                    if curr_lat is not None and curr_lng is not None:
+                        d = _dist(curr_lat, curr_lng, t.get("lat"), t.get("lng"))
+                        if d > 13: continue
+                    if not peek:
+                        used_tour_names.add(name)
                     return t
         return None
 
     itinerary = []
 
     for day_num in range(1, num_days + 1):
-        # Reset tên quán đã dùng mỗi ngày mới
-        used_food_names_today: set[str] = set()
-
         slots = []
+        
+        # Bắt đầu ngày mới từ khách sạn
+        curr_lat, curr_lng = hotel_lat, hotel_lng
 
-        # ── Chốt 3 tour của ngày trước để tính midpoint ─────────────────────
-        # Peek trước (không mark used) rồi mới pick từng cái theo thứ tự.
-        # Giải pháp đơn giản: pick cả 3 tour ngay đầu ngày, sau đó gán vào slot.
-        tour_m = _next_tour(SLOT_MORNING)
-        tour_a = _next_tour(SLOT_AFTERNOON)
-        tour_e = _next_tour(SLOT_EVENING)
+        def update_curr(item):
+            nonlocal curr_lat, curr_lng
+            if item and item.get("lat") and item.get("lng"):
+                curr_lat = float(item["lat"])
+                curr_lng = float(item["lng"])
 
-        # ── SÁNG: tour_m + food(midpoint(tour_m, tour_a)) ───────────────────
+        skip_afternoon = False
+
+        # ── SÁNG ───────────────────
+        tour_m = _next_tour(SLOT_MORNING, curr_lat, curr_lng)
         morning_items = []
         if tour_m:
             tour_m["item_type"] = "tour"
             morning_items.append(tour_m)
+            update_curr(tour_m)
 
-            food_m = _pick_food_midpoint(
-                prev_tour=tour_m,
-                next_tour=tour_a,       # midpoint hướng tới tour chiều
-                food_pool=all_foods,
-                used_food_names=used_food_names_today,
-                ideal_price=ideal_price,
-                preferred_slot=SLOT_MORNING,
-            )
-            if food_m:
-                km = _dist(tour_m.get("lat"), tour_m.get("lng"),
-                           food_m.get("lat"), food_m.get("lng"))
-                food_m["item_type"] = "food"
-                food_m["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
-                morning_items.append(food_m)
-                used_food_names_today.add(food_m.get("name", ""))
+            if is_big_tour(tour_m.get("name")):
+                skip_afternoon = True
+                tour_m["note"] = "Dành trọn thời gian (Sáng & Chiều)"
+            else:
+                # Lọc food <= 13km chim bay từ điểm hiện tại (~20km lái xe)
+                nearby_foods = [f for f in all_foods if curr_lat is None or _dist(curr_lat, curr_lng, f.get("lat"), f.get("lng")) <= 13]
+                peek_tour_a = _next_tour(SLOT_AFTERNOON, curr_lat, curr_lng, peek=True)
+                
+                food_m = _pick_food_midpoint(
+                    prev_tour=tour_m,
+                    next_tour=peek_tour_a,
+                    food_pool=nearby_foods,
+                    used_food_names=used_food_names,
+                    ideal_price=ideal_price,
+                    preferred_slot=SLOT_MORNING,
+                )
+                if food_m:
+                    km = _dist(tour_m.get("lat"), tour_m.get("lng"), food_m.get("lat"), food_m.get("lng"))
+                    food_m["item_type"] = "food"
+                    food_m["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
+                    morning_items.append(food_m)
+                    used_food_names.add(food_m.get("name", ""))
+                    update_curr(food_m)
 
         if morning_items:
             slots.append({"slot": SLOT_MORNING, "items": morning_items})
 
-        # ── CHIỀU: tour_a + food(midpoint(tour_a, tour_e)) ──────────────────
+        # ── CHIỀU ──────────────────
         afternoon_items = []
-        if tour_a:
-            tour_a["item_type"] = "tour"
-            afternoon_items.append(tour_a)
+        if not skip_afternoon:
+            tour_a = _next_tour(SLOT_AFTERNOON, curr_lat, curr_lng)
+            if tour_a:
+                tour_a["item_type"] = "tour"
+                afternoon_items.append(tour_a)
+                update_curr(tour_a)
 
-            food_a = _pick_food_midpoint(
-                prev_tour=tour_a,
-                next_tour=tour_e,       # midpoint hướng tới tour tối (có thể None)
-                food_pool=all_foods,
-                used_food_names=used_food_names_today,
-                ideal_price=ideal_price,
-                preferred_slot=SLOT_AFTERNOON,
-            )
-            if food_a:
-                km = _dist(tour_a.get("lat"), tour_a.get("lng"),
-                           food_a.get("lat"), food_a.get("lng"))
-                food_a["item_type"] = "food"
-                food_a["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
-                afternoon_items.append(food_a)
-                used_food_names_today.add(food_a.get("name", ""))
+                if is_big_tour(tour_a.get("name")):
+                    tour_a["note"] = "Dành trọn thời gian Chiều"
+                else:
+                    nearby_foods = [f for f in all_foods if curr_lat is None or _dist(curr_lat, curr_lng, f.get("lat"), f.get("lng")) <= 13]
+                    peek_tour_e = _next_tour(SLOT_EVENING, curr_lat, curr_lng, peek=True)
+                    
+                    food_a = _pick_food_midpoint(
+                        prev_tour=tour_a,
+                        next_tour=peek_tour_e,
+                        food_pool=nearby_foods,
+                        used_food_names=used_food_names,
+                        ideal_price=ideal_price,
+                        preferred_slot=SLOT_AFTERNOON,
+                    )
+                    if food_a:
+                        km = _dist(tour_a.get("lat"), tour_a.get("lng"), food_a.get("lat"), food_a.get("lng"))
+                        food_a["item_type"] = "food"
+                        food_a["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
+                        afternoon_items.append(food_a)
+                        used_food_names.add(food_a.get("name", ""))
+                        update_curr(food_a)
 
         if afternoon_items:
             slots.append({"slot": SLOT_AFTERNOON, "items": afternoon_items})
 
-        # ── TỐI: [tour_e] + food_evening ────────────────────────────────────
-        # Food tối không cần midpoint — tối là thời điểm ăn uống/giải trí thuần,
-        # chọn gần tour_e (nếu có) hoặc theo best_time=evening.
+        # ── TỐI ────────────────────────────────────
+        tour_e = _next_tour(SLOT_EVENING, curr_lat, curr_lng)
         evening_items = []
         if tour_e:
             tour_e["item_type"] = "tour"
             evening_items.append(tour_e)
+            update_curr(tour_e)
 
+        nearby_foods = [f for f in all_foods if curr_lat is None or _dist(curr_lat, curr_lng, f.get("lat"), f.get("lng")) <= 13]
         food_e = _pick_food_midpoint(
-            prev_tour=tour_e,           # gần tour tối nếu có
-            next_tour=None,             # không có tour sau
-            food_pool=all_foods,
-            used_food_names=used_food_names_today,
+            prev_tour=tour_e,
+            next_tour=None,
+            food_pool=nearby_foods,
+            used_food_names=used_food_names,
             ideal_price=ideal_price,
             preferred_slot=SLOT_EVENING,
         )
         if food_e:
             food_e["item_type"] = "food"
-            food_e.pop("note", None)    # không cần "gần X km" cho slot tối
+            food_e.pop("note", None)
             evening_items.append(food_e)
-            used_food_names_today.add(food_e.get("name", ""))
+            used_food_names.add(food_e.get("name", ""))
+            update_curr(food_e)
 
         if evening_items:
             slots.append({"slot": SLOT_EVENING, "items": evening_items})

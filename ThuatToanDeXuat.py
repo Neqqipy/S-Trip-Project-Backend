@@ -1,4 +1,4 @@
-﻿import math
+import math
 import re
 
 # ---------------------------------------------------------------------------
@@ -265,7 +265,7 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
     if not hotels or not tours:
         return hotels, tours, foods
 
-        hotel_lat   = float(hotels[0].get("lat", 0) or 0)
+    hotel_lat   = float(hotels[0].get("lat", 0) or 0)
     hotel_lng   = float(hotels[0].get("lng", 0) or 0)
     ideal_price = (budget * 0.2) / 3
 
@@ -281,7 +281,7 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(t, hotel_lat, hotel_lng, ideal_price, 100_000), 4
             )
             valid_tours.append(t)
-    
+
     valid_tours.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     tours = valid_tours
 
@@ -295,9 +295,8 @@ def apply_recommendation_algorithm(hotels, tours, foods, budget):
                 _score_activity(f, tour_center_lat, tour_center_lng, ideal_price, 150_000), 4
             )
             valid_foods.append(f)
-            
+
     valid_foods.sort(key=lambda x: x.get('ai_score', 0), reverse=True)
     foods = valid_foods
-
 
     return hotels, tours, foods
