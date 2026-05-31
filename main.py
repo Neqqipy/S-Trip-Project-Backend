@@ -59,6 +59,7 @@ init_oauth(app)
 # FIX: In-memory cache cho proxy ảnh — tránh fetch lại cùng URL nhiều lần
 _proxy_image_cache = {}
 _tips_cache = {}
+_activity_cache = {}
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -154,13 +155,15 @@ def chat_gemini():
         location = data.get("location", "Đà Nẵng")
 
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
 
         full_prompt = f"Bạn là trợ lý du lịch. Hãy trả lời cực kỳ ngắn gọn câu hỏi của bạn về du lịch {location}: {user_msg}"
 
+        print(f"[AI Chat] 🚀 Đang gọi Gemini 3.1 dự đoán ngân sách/thời tiết...")
         response = model.generate_content(full_prompt)
 
         if response and response.text:
+            print(f"[AI Chat] ✅ AI dự đoán thành công!")
             return jsonify({"success": True, "text": response.text})
         else:
             return jsonify({"success": False, "error": "Empty response"})
@@ -214,6 +217,40 @@ def to_proxy_url(url, base=None):
             optimized = optimized + "=w600-h450-k-no"
 
     return f"{base}/api/proxy-image?url={urllib.parse.quote(optimized, safe='')}"
+
+# ----------------------------------------------------------------
+# 🕐 PHÂN LOẠI BUỔI PHÙ HỢP CHO ĐỊA ĐIỂM
+# ----------------------------------------------------------------
+_TIME_KEYWORDS = {
+    "morning": [
+        "núi", "thác", "hồ", "vịnh", "bình minh", "sunrise",
+        "trekking", "leo núi", "hiking", "rừng", "vườn quốc gia",
+        "biển sáng", "đảo", "hang động", "đi bộ",
+        "cà phê", "cafe", "coffee", "bánh mì", "phở", "bún",
+        "chợ sáng", "chùa", "đền", "lăng", "tẩm", "làng nghề", "chợ nổi",
+        "sáng", "điểm tâm", "cung đình", "đại nội", "cố đô", "thiên nhiên"
+    ],
+    "afternoon": [
+        "bảo tàng", "museum", "gallery", "triển lãm", "di tích",
+        "khu phố cổ", "trung tâm thương mại",
+        "mua sắm", "shopping", "spa", "công viên", "vui chơi",
+        "tháp", "cầu", "toà nhà", "kiến trúc", "làng",
+        "chiều", "hoàng hôn", "chè", "ăn vặt", "kem", "nắng", "biển", "trưa"
+    ],
+    "evening": [
+        "nhà hàng", "restaurant", "quán ăn", "hải sản", "lẩu",
+        "nướng", "buffet", "dimsum", "sushi", "cơm tối", "ốc",
+        "chợ đêm", "night market", "bar", "pub", "rooftop",
+        "club", "show", "biểu diễn", "sunset", "phố đi bộ",
+        "view đêm", "phố đêm", "tối", "đêm", "night", "evening", "nhậu"
+    ],
+}
+
+_SLOT_LABEL = {
+    "morning":   "🌅 Buổi sáng",
+    "afternoon": "☀️ Buổi chiều",
+    "evening":   "🌙 Buổi tối",
+}
 
 def _guess_best_time(name: str, desc: str) -> str:
     """
@@ -313,6 +350,11 @@ def get_real_activities(location, query_type):
     Mỗi địa điểm trả về có thêm trường `best_time` (buổi phù hợp nhất).
     Trả về [] nếu không có SERPAPI_KEY.
     """
+    cache_key = f"{location}_{query_type}"
+    if cache_key in _activity_cache:
+        print(f"[Cache Hit] get_real_activities: {cache_key}")
+        return _activity_cache[cache_key]
+
     GoogleSearch = get_google_search()
     if not GoogleSearch:
         print(f"[Cảnh báo] Không có SERPAPI_KEY, bỏ qua tìm kiếm '{query_type}'")
@@ -392,11 +434,43 @@ def get_real_activities(location, query_type):
                 # FIX: place_id (ChIJ) cho embed map, data_id (0x) cho photos API
                 "place_id":  maps_place_id,
                 "data_id":   raw_data_id,
-                # ✅ Gắn nhãn buổi phù hợp dựa trên keyword trong tên + mô tả
-                "best_time": _guess_best_time(name, desc),
+                # Tạm thời gán None, lát nữa gọi AI batch
+                "best_time": None,
             })
 
-        return processed_results[:20]
+        # ✅ Gọi AI phân loại hàng loạt cho tất cả các địa điểm vừa tìm được
+        names_with_desc = [{"name": r["name"], "desc": r.get("desc", "")} for r in processed_results]
+        ai_labels = {}
+        try:
+            from ai_time_filter import get_ai_time_filter
+            ai_labels = get_ai_time_filter(names_with_desc)
+        except Exception as e:
+            print(f"[AI Time Filter Error] {e}")
+
+        _SLOT_MAP = {
+            "morning": "🌅 Buổi sáng",
+            "afternoon": "☀️ Buổi chiều",
+            "evening": "🌙 Buổi tối"
+        }
+
+        # Gắn nhãn AI và giá, nếu AI trượt thì fallback
+        for item in processed_results:
+            ai_data = ai_labels.get(item["name"], {})
+            
+            # 1. Gán thời gian
+            best_time_key = ai_data.get("best_time")
+            if best_time_key in _SLOT_MAP:
+                item["best_time"] = _SLOT_MAP[best_time_key]
+            else:
+                item["best_time"] = _guess_best_time(item["name"], item["desc"])
+                
+            # 2. Cập nhật giá dự đoán
+            if ai_data.get("estimated_price") and item["price"] == "Giá tuỳ chọn":
+                item["price"] = ai_data["estimated_price"]
+
+        final_results = processed_results[:20]
+        _activity_cache[cache_key] = final_results
+        return final_results
 
     except Exception as e:
         print(f"[Lỗi SerpAPI - {query_type}] {str(e)}")
@@ -449,9 +523,10 @@ def plan_trip():
             # ── 1. Địa điểm tham quan + ăn uống (fetch TRƯỚC để tính trung tâm thực tế) ──
             future_tours = executor.submit(get_real_activities, location, "Điểm tham quan")
             future_foods = executor.submit(get_real_activities, location, "Quán ăn ngon")
+            future_breakfasts = executor.submit(get_real_activities, location, "Quán ăn sáng")
             
             tours = future_tours.result()
-            foods = future_foods.result()
+            foods = future_foods.result() + future_breakfasts.result()
 
             # ── 2. Tìm Khách sạn & Lấy khoảng cách (chạy song song) ──
             future_hotels = executor.submit(

@@ -1,4 +1,4 @@
-﻿"""
+"""
 itinerary_builder.py
 ────────────────────
 Xây dựng lịch trình theo ngày/buổi từ danh sách tours + foods đã được
@@ -96,26 +96,26 @@ def _pick_food_midpoint(
     next_tour: Optional[dict],
     food_pool: list[dict],
     used_food_names: set,
+    used_food_today: set,
     ideal_price: float = 100_000,
     preferred_slot: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Chọn quán ăn nằm gần MIDPOINT giữa tour trước và tour sau.
-
-    - Dùng pick_food_for_slot() từ ThuatToanDeXuat (midpoint + distance scoring).
-    - Lọc thêm preferred_slot: ưu tiên quán có best_time phù hợp buổi.
-    - used_food_names: set[str] tên quán đã dùng HÔM NAY → tránh lặp trong ngày.
-    - Nếu tất cả đều đã dùng, bỏ filter để tránh trả None.
+    - used_food_names: Tránh lặp quán qua các ngày (nếu có thể).
+    - used_food_today: KIÊN QUYẾT tránh lặp quán trong cùng 1 ngày.
     """
     if not food_pool:
         return None
 
-    # Thử chọn có filter buổi trước
     preferred = [
         f for f in food_pool
         if not preferred_slot or f.get("best_time") == preferred_slot
-    ] or food_pool  # fallback toàn pool nếu không có quán phù hợp buổi
+    ]
+    if not preferred:
+        return None
 
+    # Lần 1: Cố gắng né tất cả các quán đã ăn trong chuyến đi
     results = pick_food_for_slot(
         preferred,
         prev_tour=prev_tour,
@@ -128,13 +128,14 @@ def _pick_food_midpoint(
     if results:
         return results[0]
 
-    # Fallback: bỏ filter used_names (tránh trả None)
+    # Fallback: bí quá thì cho ăn lại quán của ngày trước, 
+    # nhưng TUYỆT ĐỐI KHÔNG ăn lại quán đã ăn trong HÔM NAY.
     results = pick_food_for_slot(
-        food_pool,
+        preferred,
         prev_tour=prev_tour,
         next_tour=next_tour,
         ideal_price=ideal_price,
-        used_names=set(),
+        used_names=used_food_today,
         top_k=1,
     )
     return results[0] if results else None
@@ -199,24 +200,24 @@ def build_itinerary(
         hotel_lng = float(hotels[0].get("lng", 0) or 0)
     def _next_tour(slot_key: str, curr_lat: float, curr_lng: float, peek: bool = False) -> Optional[dict]:
         """Lấy tour chưa dùng từ slot đúng. Kiểm tra khoảng cách đường chim bay <= 13km"""
-        for try_slot in [slot_key, SLOT_MORNING, SLOT_AFTERNOON, SLOT_EVENING]:
-            pool = tour_pools.get(try_slot, [])
-            for t in pool:
-                name = t.get("name")
-                if name not in used_tour_names:
-                    # Kiểm tra khoảng cách di chuyển từ điểm hiện tại
-                    if curr_lat is not None and curr_lng is not None:
-                        d = _dist(curr_lat, curr_lng, t.get("lat"), t.get("lng"))
-                        if d > 13: continue
-                    if not peek:
-                        used_tour_names.add(name)
-                    return t
+        pool = tour_pools.get(slot_key, [])
+        for t in pool:
+            name = t.get("name")
+            if name not in used_tour_names:
+                # Kiểm tra khoảng cách di chuyển từ điểm hiện tại
+                if curr_lat is not None and curr_lng is not None:
+                    d = _dist(curr_lat, curr_lng, t.get("lat"), t.get("lng"))
+                    if d > 13: continue
+                if not peek:
+                    used_tour_names.add(name)
+                return t
         return None
 
     itinerary = []
 
     for day_num in range(1, num_days + 1):
         slots = []
+        used_food_today = set()
         
         # Bắt đầu ngày mới từ khách sạn
         curr_lat, curr_lng = hotel_lat, hotel_lng
@@ -250,6 +251,7 @@ def build_itinerary(
                     next_tour=peek_tour_a,
                     food_pool=nearby_foods,
                     used_food_names=used_food_names,
+                    used_food_today=used_food_today,
                     ideal_price=ideal_price,
                     preferred_slot=SLOT_MORNING,
                 )
@@ -259,6 +261,7 @@ def build_itinerary(
                     food_m["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
                     morning_items.append(food_m)
                     used_food_names.add(food_m.get("name", ""))
+                    used_food_today.add(food_m.get("name", ""))
                     update_curr(food_m)
 
         if morning_items:
@@ -284,6 +287,7 @@ def build_itinerary(
                         next_tour=peek_tour_e,
                         food_pool=nearby_foods,
                         used_food_names=used_food_names,
+                        used_food_today=used_food_today,
                         ideal_price=ideal_price,
                         preferred_slot=SLOT_AFTERNOON,
                     )
@@ -293,6 +297,7 @@ def build_itinerary(
                         food_a["note"] = f"Gần đây ~{km:.1f} km" if km < 9999 else "Gần khu vực"
                         afternoon_items.append(food_a)
                         used_food_names.add(food_a.get("name", ""))
+                        used_food_today.add(food_a.get("name", ""))
                         update_curr(food_a)
 
         if afternoon_items:
@@ -312,6 +317,7 @@ def build_itinerary(
             next_tour=None,
             food_pool=nearby_foods,
             used_food_names=used_food_names,
+            used_food_today=used_food_today,
             ideal_price=ideal_price,
             preferred_slot=SLOT_EVENING,
         )
@@ -320,6 +326,7 @@ def build_itinerary(
             food_e.pop("note", None)
             evening_items.append(food_e)
             used_food_names.add(food_e.get("name", ""))
+            used_food_today.add(food_e.get("name", ""))
             update_curr(food_e)
 
         if evening_items:
