@@ -1,7 +1,8 @@
-﻿# pip install -r requirements.txt
+# pip install -r requirements.txt
 # python main.py
 
 import os, re, urllib.parse, time, requests
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -179,60 +180,40 @@ GOOGLE_IMG_DOMAINS = (
 )
 
 def to_proxy_url(url, base=None):
+    """
+    Wrap URL ảnh qua /api/proxy-image.
+    - Ảnh local (/assets/...) hoặc data:/blob: → trả nguyên
+    - placeholder → trả nguyên
+    - Tất cả external URL → wrap qua proxy (đồng bộ với proxyImage() frontend)
+    """
     if not url:
         return url
-        
+    if url.startswith("data:") or url.startswith("blob:"):
+        return url
+    if "placehold.co" in url or "placeholder" in url:
+        return url
     if "api/proxy-image" in url:
         return url
+    # Ảnh local same-origin (bắt đầu bằng /) → không cần proxy
+    if url.startswith("/"):
+        return url
 
+    if base is None:
+        try:
+            from flask import request as _req
+            base = _req.host_url.rstrip("/")
+        except RuntimeError:
+            base = os.getenv("API_BASE_URL", "http://localhost:5000")
+
+    # Google Maps: ép size w600-h450 để ảnh nét hơn
+    optimized = url
     if any(d in url for d in GOOGLE_IMG_DOMAINS):
-        if base is None:
-            try:
-                from flask import request as _req
-                base = _req.host_url.rstrip("/")
-            except RuntimeError:
-                base = os.getenv("API_BASE_URL", "http://localhost:5000")
-        return f"{base}/api/proxy-image?url={urllib.parse.quote(url, safe='')}"
-    return url
+        if "=" in optimized:
+            optimized = optimized[:optimized.index("=")] + "=w600-h450-k-no"
+        else:
+            optimized = optimized + "=w600-h450-k-no"
 
-
-# ----------------------------------------------------------------
-# 🕐 PHÂN LOẠI BUỔI PHÙ HỢP CHO ĐỊA ĐIỂM
-# ----------------------------------------------------------------
-
-# Keyword → buổi phù hợp (evening & morning dễ nhận diện hơn afternoon)
-_TIME_KEYWORDS = {
-    "morning": [
-        # Thiên nhiên / ngoài trời — nên đi sớm tránh nắng
-        "núi", "thác", "hồ", "vịnh", "bình minh", "sunrise",
-        "trekking", "leo núi", "hiking", "rừng", "vườn quốc gia",
-        "biển sáng", "đảo", "hang động",
-        # Ẩm thực & địa điểm sáng sớm
-        "cà phê", "cafe", "coffee", "bánh mì", "phở", "bún",
-        "chợ sáng", "chùa", "đền", "làng nghề", "chợ nổi",
-    ],
-    "afternoon": [
-        "bảo tàng", "museum", "gallery", "triển lãm", "di tích",
-        "khu phố cổ", "phố đi bộ", "trung tâm thương mại",
-        "mua sắm", "shopping", "spa", "công viên", "vui chơi",
-        "tháp", "cầu", "toà nhà", "kiến trúc", "làng",
-    ],
-    "evening": [
-        # Ẩm thực tối
-        "nhà hàng", "restaurant", "quán ăn", "hải sản", "lẩu",
-        "nướng", "buffet", "dimsum", "sushi", "cơm tối",
-        # Giải trí & cảnh đêm
-        "chợ đêm", "night market", "bar", "pub", "rooftop",
-        "club", "show", "biểu diễn", "hoàng hôn", "sunset",
-        "view đêm", "phố đêm", "tối", "đêm", "night", "evening",
-    ],
-}
-
-_SLOT_LABEL = {
-    "morning":   "🌅 Buổi sáng",
-    "afternoon": "☀️ Buổi chiều",
-    "evening":   "🌙 Buổi tối",
-}
+    return f"{base}/api/proxy-image?url={urllib.parse.quote(optimized, safe='')}"
 
 def _guess_best_time(name: str, desc: str) -> str:
     """
@@ -357,6 +338,27 @@ def get_real_activities(location, query_type):
         for r in results:
             img_url = r.get("thumbnail") or r.get("featured_image")
 
+            # Bỏ qua thumbnail bị mờ (encrypted-tbn) của SerpAPI
+            if img_url and "encrypted-tbn" in img_url:
+                img_url = None
+                
+            raw_data_id  = r.get("data_id", "")
+
+            # Ưu tiên lấy ảnh chất lượng cao trực tiếp bằng data_id (tiết kiệm SerpAPI call)
+            if not img_url and raw_data_id:
+                try:
+                    photos_res = GoogleSearch({
+                        "engine": "google_maps_photos",
+                        "data_id": raw_data_id,
+                        "hl": "vi",
+                        "api_key": SERPAPI_KEY,
+                    }).get_dict()
+                    photos = photos_res.get("photos", [])
+                    if photos:
+                        img_url = photos[0].get("image") or photos[0].get("thumbnail")
+                except Exception:
+                    pass
+
             # Nếu SerpAPI không trả ảnh, tìm ảnh thật từ Maps / Google Images
             if not img_url:
                 img_url = get_activity_image_fallback(r.get("title", ""), location, SERPAPI_KEY)
@@ -442,39 +444,43 @@ def plan_trip():
     transport_budget = budget * 0.4
 
     try:
-        # ── 1. Địa điểm tham quan + ăn uống (fetch TRƯỚC để tính trung tâm thực tế) ──
-        # Trung tâm = trung bình tọa độ tours+foods, chính xác hơn geocode tỉnh
-        # VD: Quảng Nam → Hội An (không phải Tam Kỳ — trung tâm hành chính tỉnh)
-        tours = get_real_activities(location, "Điểm tham quan")
-        foods = get_real_activities(location, "Quán ăn ngon")
-
-        # ── 2. Tìm Khách sạn — lọc theo trung tâm tours+foods ───────────────
-        hotels = get_smart_hotel_recommendations(
-            SERPAPI_KEY, location, hotel_budget, num_days, passengers, departure_date,
-            tours=tours, foods=foods,  # ✅ truyền vào để tính trung tâm thực tế
-        )
-
-        # ── 2. LẤY KHOẢNG CÁCH THỰC TẾ (Google Directions qua direction_service) ─
-        driving_info = None
-        distance_m   = None
-        driving_duration_text = None
-        try:
-            all_modes = get_all_modes_directions(SERPAPI_KEY, origin, location)
+        # Dùng ThreadPoolExecutor để chạy song song các API gọi ra ngoài (tăng tốc đáng kể)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # ── 1. Địa điểm tham quan + ăn uống (fetch TRƯỚC để tính trung tâm thực tế) ──
+            future_tours = executor.submit(get_real_activities, location, "Điểm tham quan")
+            future_foods = executor.submit(get_real_activities, location, "Quán ăn ngon")
             
-            # --- FIX: KIỂM TRA LINH HOẠT LIST HAY DICT ---
-            if isinstance(all_modes, dict):
-                driving_info = all_modes.get("driving") or all_modes.get("car")
-            elif isinstance(all_modes, list):
-                for m in all_modes:
-                    if isinstance(m, dict) and m.get("mode") in ["driving", "car"]:
-                        driving_info = m
-                        break
+            tours = future_tours.result()
+            foods = future_foods.result()
 
-            if driving_info:
-                distance_m            = driving_info.get("distance_m")
-                driving_duration_text = driving_info.get("duration_text")
-        except Exception as dir_err:
-            print(f"[plan_trip] Không lấy được khoảng cách: {dir_err}")
+            # ── 2. Tìm Khách sạn & Lấy khoảng cách (chạy song song) ──
+            future_hotels = executor.submit(
+                get_smart_hotel_recommendations,
+                SERPAPI_KEY, location, hotel_budget, num_days, passengers, departure_date,
+                tours=tours, foods=foods
+            )
+            future_directions = executor.submit(get_all_modes_directions, SERPAPI_KEY, origin, location)
+
+            hotels = future_hotels.result()
+            
+            driving_info = None
+            distance_m   = None
+            driving_duration_text = None
+            try:
+                all_modes = future_directions.result()
+                if isinstance(all_modes, dict):
+                    driving_info = all_modes.get("driving") or all_modes.get("car")
+                elif isinstance(all_modes, list):
+                    for m in all_modes:
+                        if isinstance(m, dict) and m.get("mode") in ["driving", "car"]:
+                            driving_info = m
+                            break
+
+                if driving_info:
+                    distance_m            = driving_info.get("distance_m")
+                    driving_duration_text = driving_info.get("duration_text")
+            except Exception as dir_err:
+                print(f"[plan_trip] Không lấy được khoảng cách: {dir_err}")
 
         # ── 3. PHÂN GIẢI SÂN BAY ────────────────────────────────────────────
         origin_info = resolve_airport(origin)
@@ -762,7 +768,7 @@ def proxy_image():
     if not url:
         return jsonify({"error": "Thiếu url"}), 400
 
-    # FIX: Mở rộng whitelist bao gồm serpapi CDN và các subdomain lh1-lh6
+    # ✅ Whitelist domain được phép proxy ảnh
     ALLOWED = (
         "lh1.googleusercontent.com",
         "lh2.googleusercontent.com",
@@ -776,16 +782,45 @@ def proxy_image():
         "geo1.ggpht.com",
         "geo2.ggpht.com",
         "geo3.ggpht.com",
-        # SerpAPI CDN thumbnails
         "serpapi.com",
         "encrypted-tbn0.gstatic.com",
         "encrypted-tbn1.gstatic.com",
         "encrypted-tbn2.gstatic.com",
         "encrypted-tbn3.gstatic.com",
+        # TripAdvisor
+        "dynamic-media-cdn.tripadvisor.com",
+        "media-cdn.tripadvisor.com",
+        "tripadvisor.com",
+        # Khác
+        "images.unsplash.com",
+        "placehold.co",
+        "via.placeholder.com",
     )
     parsed = urllib.parse.urlparse(url)
-    # FIX: Kiểm tra suffix thay vì exact match để bắt subdomain động
-    netloc = parsed.netloc
+    netloc = parsed.netloc  # vd: "localhost:3000" hoặc "lh3.googleusercontent.com"
+
+    # ✅ Ảnh same-origin (localhost dev hoặc frontend production) → fetch trực tiếp
+    # _toDataUrl trong AiSchedule gửi img.src dạng "http://localhost:3000/assets/vj.png"
+    # vào đây — không cần proxy vòng, fetch thẳng từ frontend server
+    frontend_host = urllib.parse.urlparse(
+        os.getenv("FRONTEND_URL", "http://localhost:3000")
+    ).netloc
+    same_origin_hosts = {request.host, frontend_host, "localhost:3000", "127.0.0.1:3000"}
+    if netloc in same_origin_hosts:
+        try:
+            req_local = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_local, timeout=5) as r:
+                content_type = r.headers.get("Content-Type", "image/png")
+                data         = r.read()
+            resp = Response(data, content_type=content_type)
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+        except Exception as e:
+            print(f"[PROXY LOCAL FAIL] {url[:80]} → {e}")
+            return Response(status=404)
+
+    # Kiểm tra whitelist cho external domain
     if not any(netloc == d or netloc.endswith("." + d) for d in ALLOWED):
         return jsonify({"error": "Domain không được phép"}), 403
 
@@ -797,15 +832,20 @@ def proxy_image():
         return resp
 
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.google.com/"}
-        )
-        with urllib.request.urlopen(req, timeout=8) as r:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer":    "https://www.google.com/",
+            "Accept":     "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
             content_type = r.headers.get("Content-Type", "image/jpeg")
             data         = r.read()
 
-        if len(_proxy_image_cache) < 300:
+        if len(_proxy_image_cache) < 500:
             _proxy_image_cache[url] = (data, content_type)
 
         resp = Response(data, content_type=content_type)
@@ -841,15 +881,23 @@ def proxy_image_b64():
         b64 = base64.b64encode(data).decode()
         return jsonify({"data": f"data:{content_type};base64,{b64}"})
 
-    ALLOWED = (
+    # ✅ Đồng bộ whitelist với /api/proxy-image
+    ALLOWED_B64 = (
+        "lh1.googleusercontent.com", "lh2.googleusercontent.com",
         "lh3.googleusercontent.com", "lh4.googleusercontent.com",
-        "lh5.googleusercontent.com", "streetviewpixels-pa.googleapis.com",
-        "maps.googleapis.com", "geo0.ggpht.com", "geo1.ggpht.com",
-        "geo2.ggpht.com", "geo3.ggpht.com",
+        "lh5.googleusercontent.com", "lh6.googleusercontent.com",
+        "streetviewpixels-pa.googleapis.com", "maps.googleapis.com",
+        "geo0.ggpht.com", "geo1.ggpht.com", "geo2.ggpht.com", "geo3.ggpht.com",
+        "serpapi.com",
+        "encrypted-tbn0.gstatic.com", "encrypted-tbn1.gstatic.com",
+        "encrypted-tbn2.gstatic.com", "encrypted-tbn3.gstatic.com",
+        "dynamic-media-cdn.tripadvisor.com", "media-cdn.tripadvisor.com",
+        "tripadvisor.com", "images.unsplash.com",
         "placehold.co", "via.placeholder.com",
     )
     parsed = urllib.parse.urlparse(url)
-    if parsed.netloc not in ALLOWED:
+    netloc_b64 = parsed.netloc
+    if not any(netloc_b64 == d or netloc_b64.endswith("." + d) for d in ALLOWED_B64):
         return jsonify({"error": "Domain không được phép"}), 403
 
     try:
