@@ -208,13 +208,13 @@ def to_proxy_url(url, base=None):
         except RuntimeError:
             base = os.getenv("API_BASE_URL", "http://localhost:5000")
 
-    # Google Maps: ép size w600-h450 để ảnh nét hơn
+    # Google Maps: ép size w1200-h900 để ảnh nét hơn
     optimized = url
     if any(d in url for d in GOOGLE_IMG_DOMAINS):
         if "=" in optimized:
-            optimized = optimized[:optimized.index("=")] + "=w600-h450-k-no"
+            optimized = optimized[:optimized.index("=")] + "=w1200-h900-k-no"
         else:
-            optimized = optimized + "=w600-h450-k-no"
+            optimized = optimized + "=w1200-h900-k-no"
 
     return f"{base}/api/proxy-image?url={urllib.parse.quote(optimized, safe='')}"
 
@@ -282,6 +282,18 @@ def _guess_best_time(name: str, desc: str) -> str:
 # 🖼️ FALLBACK ẢNH CHO ACTIVITY
 # ----------------------------------------------------------------
 
+def _best_photo_url(photo: dict) -> str | None:
+    """
+    Ưu tiên lấy ảnh chất lượng cao nhất từ 1 phần tử trong mảng 'photos' SerpAPI.
+    Thứ tự: original_image > image_url > image > thumbnail
+    """
+    return (
+        photo.get("original_image")
+        or photo.get("image_url")
+        or photo.get("image")
+        or photo.get("thumbnail")
+    )
+
 def get_activity_image_fallback(place_name, location, api_key):
     """
     Tìm ảnh thật cho tour/food theo 2 tầng:
@@ -317,7 +329,7 @@ def get_activity_image_fallback(place_name, location, api_key):
                 "api_key": api_key,
             }).get_dict().get("photos", [])
             if photos:
-                img = photos[0].get("image") or photos[0].get("thumbnail")
+                img = _best_photo_url(photos[0])
                 if img:
                     return img
     except Exception:
@@ -335,6 +347,22 @@ def get_activity_image_fallback(place_name, location, api_key):
             if img:
                 return img
     except Exception:
+        pass
+
+    # Tầng 3: Wikipedia API (Miễn phí, không cần key, hữu ích khi SerpAPI hết hạn mức)
+    try:
+        import requests, urllib.parse
+        wiki_url = f"https://vi.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={urllib.parse.quote(place_name + ' ' + location)}&gsrlimit=1&prop=pageimages&format=json&piprop=original"
+        wiki_res = requests.get(wiki_url, timeout=5).json()
+        pages = wiki_res.get("query", {}).get("pages", {})
+        if pages:
+            for page_id, page_data in pages.items():
+                if "original" in page_data:
+                    img = page_data["original"]["source"]
+                    if img:
+                        return img
+    except Exception as e:
+        print(f"[Wikipedia Fallback Error]: {e}")
         pass
 
     return None
@@ -378,9 +406,9 @@ def get_real_activities(location, query_type):
 
         processed_results = []
         for r in results:
-            img_url = r.get("thumbnail") or r.get("featured_image")
+            img_url = r.get("featured_image")  # thumbnail local_results quá nhỏ, bỏ qua
 
-            # Bỏ qua thumbnail bị mờ (encrypted-tbn) của SerpAPI
+            # Nếu featured_image là encrypted-tbn thì cũng bỏ
             if img_url and "encrypted-tbn" in img_url:
                 img_url = None
                 
@@ -397,7 +425,7 @@ def get_real_activities(location, query_type):
                     }).get_dict()
                     photos = photos_res.get("photos", [])
                     if photos:
-                        img_url = photos[0].get("image") or photos[0].get("thumbnail")
+                        img_url = _best_photo_url(photos[0])
                 except Exception:
                     pass
 
@@ -821,6 +849,23 @@ def get_place_images():
             photos = data.get("photos", [])
 
         images = [p.get("image") or p.get("thumbnail") for p in photos if p.get("image") or p.get("thumbnail")]
+        
+        # 3. FALLBACK WIKIPEDIA NẾU KHÔNG CÓ ẢNH TỪ SERPAPI (Hết Quota)
+        if not images and place:
+            try:
+                import requests, urllib.parse
+                wiki_url = f"https://vi.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={urllib.parse.quote(place)}&gsrlimit=1&prop=pageimages&format=json&piprop=original"
+                wiki_res = requests.get(wiki_url, timeout=5).json()
+                pages = wiki_res.get("query", {}).get("pages", {})
+                if pages:
+                    for page_id, page_data in pages.items():
+                        if "original" in page_data:
+                            img = page_data["original"]["source"]
+                            if img:
+                                images.append(img)
+            except Exception as e:
+                print(f"[Wikipedia Fallback Error /api/places/images]: {e}")
+
         return jsonify({"success": True, "images": images[:10]})
 
     except Exception as e:
@@ -870,6 +915,7 @@ def proxy_image():
         "images.unsplash.com",
         "placehold.co",
         "via.placeholder.com",
+        "upload.wikimedia.org",
     )
     parsed = urllib.parse.urlparse(url)
     netloc = parsed.netloc  # vd: "localhost:3000" hoặc "lh3.googleusercontent.com"
