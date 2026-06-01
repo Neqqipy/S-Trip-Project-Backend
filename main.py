@@ -157,7 +157,25 @@ def chat_gemini():
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         model = genai.GenerativeModel('gemini-3.1-flash-lite')
 
-        full_prompt = f"Bạn là trợ lý du lịch. Hãy trả lời cực kỳ ngắn gọn câu hỏi của bạn về du lịch {location}: {user_msg}"
+        if "ước tính chi phí trung bình" in user_msg:
+            full_prompt = user_msg
+        else:
+            full_prompt = f"""Bạn là trợ lý du lịch của S-Trip. Hãy trả lời ngắn gọn, thân thiện câu hỏi về du lịch {location}: {user_msg}
+
+LƯU Ý QUAN TRỌNG: 
+Nếu người dùng yêu cầu THAY ĐỔI / THÊM / ĐỔI địa điểm trong lịch trình (ví dụ: "đổi điểm tối ngày 1 thành Quốc Học Huế", "thay nhà hàng trưa bằng quán X"), bạn PHẢI:
+1. Trả lời bằng chữ bình thường (vd: "Đã ghi nhận, mình vừa đổi...").
+2. Kèm theo một khối JSON ở CUỐI CÙNG câu trả lời, bọc trong ```json và ```, đúng định dạng sau:
+```json
+{{
+  "action": "UPDATE_SCHEDULE",
+  "day": 1,
+  "session": "evening",
+  "place": "Tên địa điểm mới"
+}}
+```
+Quy ước session: sáng -> "morning", trưa/chiều -> "afternoon", tối -> "evening".
+Nếu KHÔNG có yêu cầu sửa lịch trình, cứ trả lời bình thường và KHÔNG trả về JSON."""
 
         print(f"[AI Chat] 🚀 Đang gọi Gemini 3.1 dự đoán ngân sách/thời tiết...")
         response = model.generate_content(full_prompt)
@@ -380,8 +398,12 @@ def get_real_activities(location, query_type):
     """
     cache_key = f"{location}_{query_type}"
     if cache_key in _activity_cache:
-        print(f"[Cache Hit] get_real_activities: {cache_key}")
-        return _activity_cache[cache_key]
+        cached_entry = _activity_cache[cache_key]
+        if time.time() - cached_entry.get("timestamp", 0) < 7 * 24 * 3600:
+            print(f"[Cache Hit] get_real_activities: {cache_key}")
+            return cached_entry["data"]
+        else:
+            del _activity_cache[cache_key]
 
     GoogleSearch = get_google_search()
     if not GoogleSearch:
@@ -497,7 +519,7 @@ def get_real_activities(location, query_type):
                 item["price"] = ai_data["estimated_price"]
 
         final_results = processed_results[:20]
-        _activity_cache[cache_key] = final_results
+        _activity_cache[cache_key] = {"data": final_results, "timestamp": time.time()}
         return final_results
 
     except Exception as e:
@@ -811,6 +833,37 @@ def get_province_images():
     except Exception as e:
         print(f"[Lỗi province-images] {e}")
         return jsonify({"success": False, "images": []})
+
+
+@app.route("/autocomplete", methods=["GET"])
+@app.route("/api/autocomplete", methods=["GET"])
+def autocomplete():
+    """
+    Tìm kiếm tự động điền (Autocomplete) qua SerpAPI google_autocomplete.
+    """
+    q = request.args.get("q", "")
+    if not q:
+        return jsonify({"success": False, "data": []})
+
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return jsonify({"success": True, "data": []})
+
+    try:
+        search = GoogleSearch({
+            "engine": "google_autocomplete",
+            "q": q,
+            "hl": "vi",
+            "gl": "vn",
+            "api_key": SERPAPI_KEY
+        })
+        results = search.get_dict().get("suggestions", [])
+        # Format trả về list string như frontend mong đợi
+        data = [r.get("value") for r in results if r.get("value")]
+        return jsonify({"success": True, "data": data[:10]})
+    except Exception as e:
+        print(f"[Lỗi autocomplete] {e}")
+        return jsonify({"success": False, "data": []})
 
 
 @app.route("/api/images", methods=["GET"])
