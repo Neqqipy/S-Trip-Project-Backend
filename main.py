@@ -852,7 +852,9 @@ def autocomplete():
         return jsonify({"success": True, "data": []})
 
     try:
-        search_query = f"{q} {location}".strip() if location else q
+        search_query = q
+        if location and location.lower() not in q.lower():
+            search_query = f"{q} {location}".strip()
         
         search = GoogleSearch({
             "engine": "google_maps",
@@ -895,9 +897,13 @@ def place_details():
         return jsonify({"success": True, "data": None})
 
     try:
+        search_query = name
+        if location and location.lower() not in name.lower():
+            search_query = f"{name} {location}".strip()
+            
         search = GoogleSearch({
             "engine": "google_maps",
-            "q": f"{name} {location}".strip(),
+            "q": search_query,
             "hl": "vi",
             "gl": "vn",
             "api_key": SERPAPI_KEY
@@ -925,6 +931,7 @@ def place_details():
         maps_place_id = r.get("place_id", "")
         if maps_place_id and maps_place_id.startswith("0x"):
             maps_place_id = ""
+        data_id = r.get("data_id", "")
 
         # Dùng hàm proxy đã có sẵn
         import urllib.parse
