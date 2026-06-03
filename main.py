@@ -839,9 +839,11 @@ def get_province_images():
 @app.route("/api/autocomplete", methods=["GET"])
 def autocomplete():
     """
-    Tìm kiếm tự động điền (Autocomplete) qua SerpAPI google_autocomplete.
+    Tìm kiếm từ khoá địa điểm (Autocomplete) qua SerpAPI google_maps.
+    Kết hợp location (địa điểm chuyến đi) vào để kết quả luôn nằm trong thành phố.
     """
     q = request.args.get("q", "")
+    location = request.args.get("location", "")
     if not q:
         return jsonify({"success": False, "data": []})
 
@@ -850,20 +852,134 @@ def autocomplete():
         return jsonify({"success": True, "data": []})
 
     try:
+        search_query = f"{q} {location}".strip() if location else q
+        
         search = GoogleSearch({
-            "engine": "google_autocomplete",
-            "q": q,
+            "engine": "google_maps",
+            "q": search_query,
             "hl": "vi",
             "gl": "vn",
             "api_key": SERPAPI_KEY
         })
-        results = search.get_dict().get("suggestions", [])
-        # Format trả về list string như frontend mong đợi
-        data = [r.get("value") for r in results if r.get("value")]
-        return jsonify({"success": True, "data": data[:10]})
+        res = search.get_dict()
+        
+        data = []
+        if "local_results" in res:
+            data = [r.get("title") for r in res["local_results"] if r.get("title")]
+        elif "place_results" in res:
+            title = res["place_results"].get("title")
+            if title:
+                data = [title]
+        
+        # Loại bỏ các địa điểm trùng lặp
+        unique_data = []
+        for title in data:
+            if title not in unique_data:
+                unique_data.append(title)
+                
+        return jsonify({"success": True, "data": unique_data[:10]})
     except Exception as e:
         print(f"[Lỗi autocomplete] {e}")
         return jsonify({"success": False, "data": []})
+
+
+@app.route("/api/place-details", methods=["GET"])
+def place_details():
+    name = request.args.get("name", "")
+    location = request.args.get("location", "")
+    if not name:
+        return jsonify({"success": False, "data": None})
+
+    GoogleSearch = get_google_search()
+    if not GoogleSearch:
+        return jsonify({"success": True, "data": None})
+
+    try:
+        search = GoogleSearch({
+            "engine": "google_maps",
+            "q": f"{name} {location}".strip(),
+            "hl": "vi",
+            "gl": "vn",
+            "api_key": SERPAPI_KEY
+        })
+        res = search.get_dict()
+        
+        if "place_results" in res:
+            r = res["place_results"]
+        elif "local_results" in res and res["local_results"]:
+            r = res["local_results"][0]
+        else:
+            return jsonify({"success": True, "data": None})
+        
+        # Tối ưu hóa lượt tìm kiếm: Bỏ qua google_maps_photos và google_images fallback
+        img_url = r.get("thumbnail", "")
+        if not img_url and "photos" in r:
+            photos = r.get("photos", [])
+            if photos and isinstance(photos, list):
+                img_url = photos[0].get("link") or photos[0].get("image") or photos[0].get("thumbnail", "")
+                
+        if not img_url:
+            img_url = "https://placehold.co/300x200?text=S-Trip"
+
+        coords = r.get("gps_coordinates", {})
+        maps_place_id = r.get("place_id", "")
+        if maps_place_id and maps_place_id.startswith("0x"):
+            maps_place_id = ""
+
+        # Dùng hàm proxy đã có sẵn
+        import urllib.parse
+        final_img = to_proxy_url(img_url) if img_url and not img_url.startswith("https://placehold.co") else img_url
+
+        desc = r.get("description", "")
+        price = r.get("price", "Giá tuỳ chọn")
+        
+        # Gọi Gemini để lấy đánh giá ngắn và giá dự đoán
+        try:
+            import google.generativeai as genai
+            import os, json, re
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            model = genai.GenerativeModel('gemini-3.1-flash-lite')
+            prompt = f"""
+Là chuyên gia du lịch địa phương. Hãy cho tôi thông tin về địa điểm "{name}" tại {location}:
+1. Dự đoán mức giá (estimated_price): Ước tính chi phí trung bình (ví dụ: "Miễn phí", "30.000đ - 50.000đ", "100.000đ - 250.000đ", "Từ 500.000đ").
+2. Đánh giá ngắn (short_review): Viết 1 câu review ngắn gọn, chân thực giống như khách du lịch nhận xét (dưới 15 từ, có thể dùng emoji).
+
+Trả về JSON OBJECT nguyên bản:
+{{
+  "estimated_price": "...",
+  "short_review": "..."
+}}
+"""
+            response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+            json_match = re.search(r'\{[\s\S]*\}', response.text)
+            if json_match:
+                ai_data = json.loads(json_match.group(0))
+                if ai_data.get("estimated_price") and price == "Giá tuỳ chọn":
+                    price = ai_data["estimated_price"]
+                if not desc and ai_data.get("short_review"):
+                    desc = f'"{ai_data["short_review"]}"'
+        except Exception as e:
+            print(f"[AI Place Details Error] {e}")
+
+        if not desc:
+            desc = "Một địa điểm thú vị đáng để ghé thăm."
+
+        place_data = {
+            "name": r.get("title", name),
+            "rating": str(r.get("rating", "4.5")),
+            "price": price,
+            "desc": desc,
+            "thumbnail": final_img,
+            "lat": coords.get("latitude"),
+            "lng": coords.get("longitude"),
+            "place_id": maps_place_id,
+            "data_id": data_id,
+            "time": "Tuỳ chọn"
+        }
+        return jsonify({"success": True, "data": place_data})
+    except Exception as e:
+        print(f"[Lỗi place-details] {e}")
+        return jsonify({"success": False, "data": None})
 
 
 @app.route("/api/images", methods=["GET"])
